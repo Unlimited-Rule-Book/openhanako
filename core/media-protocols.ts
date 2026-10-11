@@ -17,8 +17,61 @@ export const MEDIA_CAPABILITY_KEYS = {
   speechRecognition: "speechRecognition",
   transcription: "speechRecognition",
   asr: "speechRecognition",
+  // 实时（流式）语音识别：与批式**分开的能力**。
+  // 批式 = 上传整段音频一次性转写（HTTP）；流式 = 边说边出字（WebSocket 双向）。
+  // 两者协议/事件模型/参数都不同，混在一个能力里会让"该走哪个协议"无从判断。
+  speech_recognition_streaming: "speechRecognitionStreaming",
+  speechRecognitionStreaming: "speechRecognitionStreaming",
+  asr_realtime: "speechRecognitionStreaming",
+  asrRealtime: "speechRecognitionStreaming",
   speech: "speechGeneration",
 };
+
+/**
+ * 实时（流式）ASR 的**协议注册表**：供应商 → 型号匹配规则 → 协议 id。
+ *
+ * 为什么做成表：实时语音识别不止一家供应商会有（百炼之外，OpenAI 有 Realtime API、
+ * 火山有流式 bigasr……）。如果把这些规则写成 `if (providerId === "dashscope" && ...)`
+ * 一层层堆在函数里，加一家就要动函数主体、还容易互相干扰。
+ * 做成表之后，**加一家供应商 = 加一条记录**。
+ *
+ * ⚠️ 但这里只决定"模型归到哪个协议"（即能不能出现在选择列表里）。
+ * 一个协议要真正能跑，还需要有对应的**执行实现**：
+ * 目前只有百炼的实时协议有实现（`server/asr-cloud-forwarder.ts` 的 WebSocket 双向转发）。
+ * 给别家加流式，除了在这里加一条，还要写它自己的转发器 —— 否则用户选得到、但一按录音就失败。
+ *
+ * match / exclude 用正则按"族"匹配，不写死具体型号：型号常带日期后缀
+ * （如 fun-asr-realtime-2026-02-28），写死会漏掉变体。
+ */
+const STREAMING_ASR_PROTOCOLS = [
+  {
+    providerId: "dashscope",
+    protocolId: "dashscope-paraformer-realtime",
+    // 与转发器依赖的事件结构（payload.output.sentence.text / .sentence_end）同构的族：
+    // paraformer-realtime-*、fun-asr-realtime*、qwen-audio-*-asr-flash-streaming
+    match: /(^|-)paraformer-realtime|^fun-asr-realtime|asr-flash-streaming/,
+    // 同属"实时"但**协议不同**，转发器认不了，显式排除（避免用户选到跑不通的型号）：
+    //   · qwen3-asr-flash-realtime / qwen3.5-omni-*-realtime —— 会话式协议，
+    //     事件名是 conversation.item.*，与 payload.output.sentence 完全不同；
+    //   · paraformer-realtime-8k-v2 —— 只接受 8k 采样，前端推的是 16k（需重采样）。
+    exclude: /^qwen3-asr-flash-realtime$|^qwen3\.5-omni-.*-realtime$|-8k-/,
+  },
+];
+
+export function resolveStreamingAsrProtocol(providerId, modelId) {
+  const id = String(modelId || "");
+  for (const entry of STREAMING_ASR_PROTOCOLS) {
+    if (entry.providerId !== providerId) continue;
+    if (entry.exclude?.test(id)) return "";
+    if (entry.match.test(id)) return entry.protocolId;
+  }
+  return "";
+}
+
+/** 当前**有执行实现**的流式协议。列表外的协议即使被声明，也跑不起来。 */
+export const IMPLEMENTED_STREAMING_ASR_PROTOCOLS = new Set([
+  "dashscope-paraformer-realtime",
+]);
 
 export function capabilityKey(capability) {
   return MEDIA_CAPABILITY_KEYS[capability] || capability;
@@ -71,6 +124,13 @@ export function inferMediaProtocolId(providerId, capability, modelId, provider: 
     if (providerId === "volcengine-speech" && id.includes("bigasr")) return "volcengine-bigasr-transcription";
     if (providerId === "system-speech") return "system-speech-recognition";
     return "";
+  }
+
+  if (key === "speechRecognitionStreaming") {
+    // 规则见上面的 STREAMING_ASR_PROTOCOLS（表驱动，加一家供应商只加一条）。
+    // 返回 "" 表示"这个模型没有可用协议" → 它不会出现在任何能力的选择列表里，
+    // 用户也就不会选到一个注定跑不通的型号。
+    return resolveStreamingAsrProtocol(providerId, id);
   }
 
   return "";

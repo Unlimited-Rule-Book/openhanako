@@ -47,6 +47,9 @@ function renderBar(overrides: Partial<React.ComponentProps<typeof InputControlBa
     audioRecordingActive={false}
     audioRecordingBusy={false}
     onAudioToggle={vi.fn()}
+    speechInputEnabled={false}
+    speechInputActive={false}
+    onSpeechInputToggle={vi.fn()}
     onSend={vi.fn()}
     onSteer={vi.fn()}
     onStop={vi.fn()}
@@ -77,5 +80,40 @@ describe('InputControlBar audio button', () => {
     renderBar({ showAudioInput: true, audioRecordingActive: true });
 
     expect(screen.getByLabelText('input.stopRecording')).toBeTruthy();
+  });
+});
+
+describe('InputControlBar speech input button', () => {
+  afterEach(() => cleanup());
+
+  it('hides the speech input button when speech recognition is disabled', () => {
+    renderBar({ speechInputEnabled: false });
+
+    expect(screen.queryByLabelText('input.startSpeechInput')).toBeNull();
+  });
+
+  it('shows the speech input button and calls the toggle handler', () => {
+    const onSpeechInputToggle = vi.fn();
+    renderBar({ speechInputEnabled: true, onSpeechInputToggle });
+
+    const button = screen.getByLabelText('input.startSpeechInput');
+    fireEvent.click(button);
+
+    expect(onSpeechInputToggle).toHaveBeenCalledTimes(1);
+  });
+
+  it('switches the speech input label while listening', () => {
+    renderBar({ speechInputEnabled: true, speechInputActive: true });
+
+    expect(screen.getByLabelText('input.stopSpeechInput')).toBeTruthy();
+  });
+
+  // 两个按钮的门控条件互相独立：作者的录音按钮依赖对话模型是否原生音频，
+  // 语音输入按钮只依赖语音识别是否启用，两者不共享状态。
+  it('stays independent from the native-audio recording button', () => {
+    renderBar({ speechInputEnabled: true, showAudioInput: false });
+
+    expect(screen.getByLabelText('input.startSpeechInput')).toBeTruthy();
+    expect(screen.queryByLabelText('input.recordAudio')).toBeNull();
   });
 });

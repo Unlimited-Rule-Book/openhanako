@@ -277,7 +277,9 @@ describe('InputArea media send', () => {
       agentId: 'hana',
     });
     seedSession();
-    mocks.hanaFetch.mockResolvedValue(new Response(JSON.stringify({
+    // 每次调用返回"新的" Response：Response body 只能被消费一次，
+    // 复用同一个实例会让第二次 .json() 抛错（输入区挂载时不只一个 GET）。
+    mocks.hanaFetch.mockImplementation(async () => new Response(JSON.stringify({
       models: {
         vision_enabled: true,
         vision: { id: 'qwen-vl', provider: 'dashscope', input: ['text', 'image'] },
@@ -622,7 +624,10 @@ describe('InputArea media send', () => {
       }));
       expect(mocks.wsSend).toHaveBeenCalledTimes(1);
     });
-    const uploadBody = JSON.parse(String(mocks.hanaFetch.mock.calls[0][1]?.body));
+    // 不再假设"第一次 hanaFetch 就是上传"：输入区挂载时还会有别的 GET
+    // （例如语音识别配置），按路径找才稳。
+    const uploadCall = mocks.hanaFetch.mock.calls.find(([path]) => path === '/api/upload-blob');
+    const uploadBody = JSON.parse(String(uploadCall?.[1]?.body));
     expect(uploadBody.waveform).toMatchObject({
       version: 1,
       durationMs: expect.any(Number),

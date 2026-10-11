@@ -32,6 +32,11 @@ interface Props {
   audioRecordingActive: boolean;
   audioRecordingBusy: boolean;
   onAudioToggle: () => void;
+  // 语音输入（流式转文字）。与上面的录音按钮互相独立：
+  // 那个走"原生音频模型 + 录音发语音条"，这个走"语音识别 + 流式写入输入框"。
+  speechInputEnabled: boolean;
+  speechInputActive: boolean;
+  onSpeechInputToggle: () => void;
   onSend: () => void;
   onSteer: () => void;
   onStop: () => void;
@@ -45,6 +50,7 @@ export const InputControlBar = memo(function InputControlBar(props: Props) {
     showThinking, thinkingLevel, onThinkingChange, availableThinkingLevels,
     models, sessionModel, isStreaming, hasInput, canSend,
     showAudioInput, audioRecordingActive, audioRecordingBusy, onAudioToggle,
+    speechInputEnabled, speechInputActive, onSpeechInputToggle,
     onSend, onSteer, onStop,
   } = props;
 
@@ -75,6 +81,32 @@ export const InputControlBar = memo(function InputControlBar(props: Props) {
         <ContextRing />
       </div>
       <div className={styles['input-controls']}>
+        {speechInputEnabled && (
+          <button
+            type="button"
+            className={`${styles['speech-input-btn']}${speechInputActive ? ` ${styles['is-listening']}` : ''}`}
+            title={t(speechInputActive ? 'input.stopSpeechInput' : 'input.startSpeechInput')}
+            aria-label={t(speechInputActive ? 'input.stopSpeechInput' : 'input.startSpeechInput')}
+            aria-pressed={speechInputActive}
+            onClick={onSpeechInputToggle}
+          >
+            {speechInputActive ? (
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M8 3a3 3 0 0 0-3 3v4a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z" />
+                <path d="M3 10v1.5a5 5 0 0 0 10 0V10" />
+                <path d="M8 16.5v2.5" />
+                <circle className={styles['speech-input-live-dot']} cx="20.5" cy="11" r="2.6" fill="currentColor" stroke="none" />
+              </svg>
+            ) : (
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M8 3a3 3 0 0 0-3 3v4a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z" />
+                <path d="M3 10v1.5a5 5 0 0 0 10 0V10" />
+                <path d="M8 16.5v2.5" />
+                <path d="M16.5 9.5v3M19.5 7.5v7M22.5 9.5v3" />
+              </svg>
+            )}
+          </button>
+        )}
         {showThinking ? (
           <div className={styles['model-split-control']}>
             <ThinkingLevelButton level={thinkingLevel} onChange={onThinkingChange} availableLevels={availableThinkingLevels} />

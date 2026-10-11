@@ -1,0 +1,14 @@
+{
+  "name": "hana-asr-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenHanako 本地流式语音识别 sidecar（基于 sherpa-onnx）。独立进程运行，绕开 Electron 的原生模块 ABI 问题。",
+  "scripts": {
+    "try-file": "node try-file.mjs"
+  },
+  "dependencies": {
+    "sherpa-onnx-node": "1.13.8",
+    "ws": "^8.22.0"
+  }
+}

@@ -37,6 +37,14 @@ import { InputControlBar } from './input/InputControlBar';
 import type { PermissionMode } from './input/PlanModeButton';
 import { SessionConfirmationPrompt } from './input/SessionConfirmationPrompt';
 import { serializeEditor } from '../utils/editor-serializer';
+import { createPcm16Converter } from '../utils/pcm16';
+import { startAsrStream, SPEECH_SAMPLE_RATE, type AsrStreamHandlers, type AsrStreamSession } from '../services/asr-stream';
+import { createBatchAsrSession } from '../services/asr-batch';
+import {
+  clearSpeechPreview,
+  setSpeechPreview,
+  speechPreviewKey,
+} from './input/speech-preview-extension';
 import {
   buildFileMentionItems,
   mergeEditorFileRefs,
@@ -490,6 +498,9 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
   // input 数组缺失视为未知；只有显式 text-only 的模型才在 UI 上标记“辅助视觉”。
   const supportsVision = !Array.isArray(currentModelInfo?.input) || currentModelInfo.input.includes("image");
   const showAudioInput = getModelAudioInputMode(currentModelInfo) === 'native-audio';
+  // 语音输入（流式转文字）的门控与上面那条完全独立：只看"语音识别是否启用"，
+  // 与当前对话模型是否支持原生音频无关。设置弹窗关闭时重新读取，保证改完即生效。
+  const settingsModalOpen = useStore(s => !!s.settingsModal?.open);
   const showThinkingControl = useMemo(
     () => shouldShowThinkingControl(currentModelInfo, models),
     [currentModelInfo, models],
@@ -545,6 +556,40 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
   const [audioRecordingStartedAt, setAudioRecordingStartedAt] = useState<number | null>(null);
   const [audioRecordingElapsed, setAudioRecordingElapsed] = useState(0);
   const [audioRecordingError, setAudioRecordingError] = useState<string | null>(null);
+  // ── 语音输入（流式转文字）的状态，与上面的录音按钮互不共用 ──
+  /** 语音识别是否已启用（由设置决定）——决定新按钮是否出现 */
+  const [speechInputEnabled, setSpeechInputEnabled] = useState(false);
+  /** 语音输入引擎（local/cloud/cloud-batch）与本地模型（zh-14M/bilingual），由设置决定 */
+  const [speechInputEngine, setSpeechInputEngine] = useState('local');
+  const [speechInputLocalModel, setSpeechInputLocalModel] = useState('zh-14M');
+  /** 云端批式**专属**的转写模型（与作者的「语音条转录模型」分开，互不影响） */
+  const [speechInputBatchModel, setSpeechInputBatchModel] = useState<{ provider: string; id: string } | null>(null);
+  /** 云端流式选中的实时模型（候选来自供应商配置，同样与另外两种方式分开存） */
+  const [speechInputCloudModel, setSpeechInputCloudModel] = useState<{ provider: string; id: string } | null>(null);
+  const [speechInputState, setSpeechInputState] = useState<'idle' | 'listening'>('idle');
+  /** 同步门闩：state 更新是异步的，靠它挡住连点导致的重复启动 */
+  const speechActiveRef = useRef(false);
+  /** 预览与最终插入的锚点（开始说话时的光标位置）；null 表示没有进行中的语音输入 */
+  const speechAnchorRef = useRef<number | null>(null);
+  /** 识别流会话（到本机 sidecar 的 WebSocket） */
+  const speechSessionRef = useRef<AsrStreamSession | null>(null);
+  /** 麦克风采集图，收尾时要逐个拆掉 */
+  const speechAudioRef = useRef<{
+    stream: MediaStream;
+    audioContext: AudioContext;
+    source: MediaStreamAudioSourceNode;
+    processor: ScriptProcessorNode;
+    silentGain: GainNode;
+  } | null>(null);
+  /** 开始说话时的草稿 key：切会话提交时要把文字写到"上一个会话"的草稿里 */
+  const speechDraftKeyRef = useRef<string | null>(null);
+  /**
+   * 语音提交期间临时屏蔽"编辑器更新 → 保存草稿"。
+   * 切会话提交时文档还属于上一个会话，若不屏蔽，更新回调会把旧内容写进新会话的草稿。
+   */
+  const speechSuppressDraftSyncRef = useRef(false);
+  /** 用户按停止后等 final 的兜底计时器，防止引擎不回声时界面卡在"聆听中" */
+  const speechFinalTimerRef = useRef<number | null>(null);
   const inputLocked = deletedAgentReadOnly || continuingDeletedAgentSession;
 
   useEffect(() => {
@@ -1392,7 +1437,9 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
         setSlashMenuOpen(false);
       }
       // 保存草稿到 store（session 内 + 首页 pending 态）；setDraft 幂等，避免空转
-      if (draftKey) {
+      // 语音"切会话提交"期间跳过：那一刻编辑器里还是上一个会话的文档，而 draftKey
+      // 已经指向新会话，照写会污染新会话的草稿（提交方会自己写正确的 key）。
+      if (draftKey && !speechSuppressDraftSyncRef.current) {
         setDraft(draftKey, text, editorJson);
       }
       // 内容超出可见区域时，自动滚动到光标位置
@@ -1401,6 +1448,305 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
     editor.on('update', handler);
     return () => { editor.off('update', handler); };
   }, [editor, draftKey, setDraft, slashCommands]);
+
+  // ── 语音输入：预览层 + 锚点提交 ────────────────────────────────────
+  // 识别引擎会不断吐出新的、而且可能被改写的 partial。这些文字**不写进文档**，
+  // 只画成 decoration 预览（见 speech-preview-extension.ts）。只有两种情况才真正
+  // 落到文档里：句末（endpoint）和用户按停止（final）。于是撤销历史、草稿保存、
+  // 光标位置这三件事都不会被高频 partial 搅乱。
+
+  /** 拆掉麦克风采集图（不碰识别流，收尾时还要等 final） */
+  const stopSpeechAudio = useCallback(() => {
+    const runtime = speechAudioRef.current;
+    speechAudioRef.current = null;
+    if (!runtime) return;
+    try { runtime.processor.onaudioprocess = null; } catch { /* 已断开 */ }
+    try { runtime.source.disconnect(); } catch { /* 已断开 */ }
+    try { runtime.processor.disconnect(); } catch { /* 已断开 */ }
+    try { runtime.silentGain.disconnect(); } catch { /* 已断开 */ }
+    try { runtime.stream.getTracks().forEach(track => track.stop()); } catch { /* 已停止 */ }
+    try { void runtime.audioContext.close(); } catch { /* 已关闭 */ }
+  }, []);
+
+  const closeSpeechSession = useCallback(() => {
+    if (speechFinalTimerRef.current !== null) {
+      window.clearTimeout(speechFinalTimerRef.current);
+      speechFinalTimerRef.current = null;
+    }
+    const session = speechSessionRef.current;
+    speechSessionRef.current = null;
+    try { session?.abort(); } catch { /* 已断开 */ }
+  }, []);
+
+  /**
+   * 把当前预览文字提交进文档。
+   * one transaction = one undo step —— 这正是"预览不进文档"换来的好处。
+   *
+   * @param overrideText 引擎在处理后事件里给的文本（**带标点、中文数字已转阿拉伯数字**）。
+   *   必须优先用它 —— 预览层里放的是**原始**识别结果，直接提交预览等于把标点和数字规整
+   *   全扔掉。（第一版就是这么错的：句末提交时忽略了事件里的 text，用户看到的永远是原始稿。）
+   * @param targetDraftKey 指定要写进哪个草稿；切会话时传上一个会话的 key
+   */
+  const commitSpeechSegment = useCallback((overrideText?: string, targetDraftKey?: string) => {
+    const ed = editor;
+    const anchor = speechAnchorRef.current;
+    if (!ed || ed.isDestroyed || anchor === null) return;
+    const preview = speechPreviewKey.getState(ed.state)?.text ?? '';
+    const text = (typeof overrideText === 'string' && overrideText) ? overrideText : preview;
+    clearSpeechPreview(ed);
+    if (!text) return;
+    const docSize = ed.state.doc.content.size;
+    // 锚点可能因文档被整体替换（切会话、撤销、草稿回填）而失效。
+    // 宁可放弃这一句，也不要拿越界位置改文档 —— 那会抛 RangeError。
+    if (anchor > docSize) return;
+
+    // 切会话场景：此刻编辑器里还是上一个会话的文档，而 draftKey 已经指向新会话。
+    // 屏蔽更新回调里的草稿写入，改成自己显式写到上一个会话的草稿，避免污染新会话。
+    const crossSession = typeof targetDraftKey === 'string' && targetDraftKey !== draftKey;
+    speechSuppressDraftSyncRef.current = crossSession;
+    try {
+      // 用 JSON text 节点插入，绕开 TiPTap 对字符串的 HTML 解析
+      ed.chain().insertContentAt(anchor, { type: 'text', text }).run();
+      speechAnchorRef.current = anchor + text.length;
+      if (crossSession) {
+        const json = ed.getJSON();
+        setDraft(targetDraftKey!, serializeEditor(json).text, json);
+      }
+    } catch (err) {
+      console.warn('[input] speech commit failed', err);
+    } finally {
+      speechSuppressDraftSyncRef.current = false;
+    }
+  }, [draftKey, editor, setDraft]);
+
+  /** 收尾并复位（不提交） */
+  const resetSpeechInput = useCallback(() => {
+    stopSpeechAudio();
+    closeSpeechSession();
+    if (editor && !editor.isDestroyed) clearSpeechPreview(editor);
+    speechAnchorRef.current = null;
+    speechDraftKeyRef.current = null;
+    speechActiveRef.current = false;
+    setSpeechInputState('idle');
+  }, [closeSpeechSession, editor, stopSpeechAudio]);
+
+  /** 收尾并提交：句末、用户按停止、切会话、输入被锁定都走这里 */
+  const endSpeechInput = useCallback((overrideText?: string, targetDraftKey?: string) => {
+    commitSpeechSegment(overrideText, targetDraftKey);
+    resetSpeechInput();
+    restoreEditorFocus();
+  }, [commitSpeechSegment, resetSpeechInput, restoreEditorFocus]);
+
+  /** partial → 只更新预览层，完全不碰文档 */
+  const applySpeechPartial = useCallback((partial: string) => {
+    const ed = editor;
+    const anchor = speechAnchorRef.current;
+    if (!ed || ed.isDestroyed || anchor === null || !partial) return;
+    if (anchor > ed.state.doc.content.size) { resetSpeechInput(); return; }
+    setSpeechPreview(ed, { pos: anchor, text: partial });
+  }, [editor, resetSpeechInput]);
+
+  const startSpeechInput = useCallback(async () => {
+    const ed = editor;
+    if (!ed || ed.isDestroyed) return;
+    // 同步门闩：speechInputState 的更新是异步的，只靠它挡不住连点
+    if (speechActiveRef.current) return;
+    speechActiveRef.current = true;
+    // 关键：记下当前光标位置，预览与最终插入都锚在这里
+    speechAnchorRef.current = ed.state.selection.from;
+    speechDraftKeyRef.current = draftKey ?? null;
+    setSpeechInputState('listening');
+
+    const AudioContextCtor = window.AudioContext
+      || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!navigator.mediaDevices?.getUserMedia || !AudioContextCtor) {
+      addToast(t('input.audioRecordingUnavailable'), 'error', 6000);
+      resetSpeechInput();
+      return;
+    }
+
+    try {
+      // 1) 先接上识别引擎（本地 sidecar 或云端转发）
+      const asrHandlers: AsrStreamHandlers = {
+        // partial 是**原始**识别结果 —— 只用于预览，不提交
+        onPartial: (text) => applySpeechPartial(text),
+        // 句末：用引擎给的**处理后**文本提交（带标点、数字已转阿拉伯数字）
+        onEndpoint: (text) => { commitSpeechSegment(text); },
+        // 整轮结束：提交剩下没提交过的那一段，然后收尾
+        onFinal: (payload) => { endSpeechInput(payload.pending || undefined); },
+        onError: (message) => {
+          // 批式专用模型没配：给一句能照做的人话，而不是把服务端的英文报错原样弹出来
+          const text = message === 'BATCH_MODEL_NOT_CONFIGURED'
+            ? t('input.speechBatchModelRequired')
+            : (message || t('input.audioRecordingFailed'));
+          addToast(text, 'error', 6000);
+          // 出错也不能丢已识别的字：预览层是用户已经说出口的内容，裸 reset 会把它
+          // 扔掉。endSpeechInput 先把预览剩余文字提交进文档层再收尾（幂等：预览
+          // 已空或已收尾时是无害的空操作）。
+          endSpeechInput();
+        },
+      };
+      let session: AsrStreamSession;
+      // 接引擎单独 try：失败（模型没下载 / sidecar 起不来等）显示真实原因，
+      // 别落到外层 catch 被冤枉成"麦克风权限"。
+      try {
+        if (speechInputEngine === 'cloud-batch') {
+          // 云端批式：不接流式连接，录音期间只攒 PCM，松手时一次性上传转写。
+          // 复用同一套 session 接口，所以下面的采集、停止、收尾逻辑全都不用改。
+          session = createBatchAsrSession({
+            sessionPath: draftKey ?? null,
+            handlers: asrHandlers,
+            batchModel: speechInputBatchModel,
+          });
+        } else if (speechInputEngine === 'cloud') {
+          try {
+            session = await startAsrStream(asrHandlers, { engine: 'cloud', cloudModel: speechInputCloudModel });
+          } catch {
+            // 云端不可用（最常见是没配 API Key）→ 回退本地，不打断用户
+            addToast(t('input.speechCloudFallback'), 'info', 4000);
+            session = await startAsrStream(asrHandlers, { engine: 'local', model: speechInputLocalModel });
+          }
+        } else {
+          session = await startAsrStream(asrHandlers, { engine: 'local', model: speechInputLocalModel });
+        }
+      } catch (err: any) {
+        addToast(err?.message || t('input.audioRecordingFailed'), 'error', 6000);
+        resetSpeechInput();
+        return;
+      }
+      speechSessionRef.current = session;
+
+      // 2) 再开麦克风
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true },
+      });
+      if (!speechActiveRef.current) {
+        // 等麦克风授权期间用户已经取消了 —— 别把已经开的流晾着
+        stream.getTracks().forEach(track => track.stop());
+        return;
+      }
+      // 让浏览器直接按 16kHz 采样；平台不认这个参数时给原生采样率，
+      // 下面用线性插值重采样兜底。
+      const audioContext = new AudioContextCtor({ sampleRate: SPEECH_SAMPLE_RATE });
+      const source = audioContext.createMediaStreamSource(stream);
+      const processor = audioContext.createScriptProcessor(4096, 1, 1);
+      const silentGain = audioContext.createGain();
+      silentGain.gain.value = 0;
+      const convert = createPcm16Converter(audioContext.sampleRate, SPEECH_SAMPLE_RATE);
+      processor.onaudioprocess = (event) => {
+        if (!speechAudioRef.current) return;
+        const payload = convert(event.inputBuffer.getChannelData(0));
+        if (payload) session.sendPcm(payload);
+      };
+      source.connect(processor);
+      processor.connect(silentGain);
+      silentGain.connect(audioContext.destination);
+      speechAudioRef.current = { stream, audioContext, source, processor, silentGain };
+    } catch (err) {
+      console.warn('[input] failed to start speech input', err);
+      addToast(t('input.audioRecordingFailed'), 'error', 6000);
+      resetSpeechInput();
+    }
+  }, [addToast, applySpeechPartial, commitSpeechSegment, draftKey, editor, endSpeechInput, resetSpeechInput, speechInputBatchModel, speechInputCloudModel, speechInputEngine, speechInputLocalModel, t]);
+
+  const handleSpeechInputToggle = useCallback(() => {
+    // 用同步 ref 判断，避免连点穿透到 startSpeechInput
+    if (speechActiveRef.current) {
+      // 用户按停止 = 立即提交剩余预览（对应 final）：先停采集，再让引擎把剩余
+      // 音频解完，final 回来时提交。兜底计时器防止引擎不回声时卡在"聆听中"。
+      const session = speechSessionRef.current;
+      stopSpeechAudio();
+      if (session) {
+        session.finish();
+        if (speechFinalTimerRef.current !== null) window.clearTimeout(speechFinalTimerRef.current);
+        // 兜底计时器：防止引擎不回声时界面卡在"聆听中"。
+        // 云端批式要上传 + 转写，比流式慢得多（几秒到十几秒），给足时间；
+        // 流式引擎正常几百毫秒就回 final，5 秒足够。
+        speechFinalTimerRef.current = window.setTimeout(() => {
+          speechFinalTimerRef.current = null;
+          endSpeechInput();
+        }, speechInputEngine === 'cloud-batch' ? 60_000 : 5000);
+      } else {
+        endSpeechInput();
+      }
+      return;
+    }
+    void startSpeechInput();
+  }, [endSpeechInput, speechInputEngine, startSpeechInput, stopSpeechAudio]);
+
+  // 切会话、输入被锁定（只读会话）时强制收尾 —— 这两种都算"用户终止了语音输入"，
+  // 把待定内容提交进文档（提交 ≠ 发送，落到输入框后用户还能自己改）。
+  // 注意切会话要写到**上一个会话**的草稿里，所以把开始时的 key 传过去。
+  //
+  // 依赖里**故意只放真正的触发条件**，不放 endSpeechInput：它的身份会随 draftKey/editor
+  // 变化，一旦放进去，任何无关的重渲染都可能触发"提前收尾"，把正在进行的语音掐掉。
+  const endSpeechInputRef = useRef<typeof endSpeechInput | null>(null);
+  useEffect(() => { endSpeechInputRef.current = endSpeechInput; }, [endSpeechInput]);
+
+  useEffect(() => {
+    if (!speechActiveRef.current) return;
+    endSpeechInputRef.current?.(undefined, speechDraftKeyRef.current ?? undefined);
+  }, [currentSessionPath, inputLocked]);
+
+  // 语音识别是否启用 —— 决定新按钮是否出现（与对话模型无关）
+  useEffect(() => {
+    let cancelled = false;
+    if (!connected) {
+      setSpeechInputEnabled(false);
+      return undefined;
+    }
+    // 用 async 包一层：这样任何实现层面的失败（返回非 Promise、响应不可解析）
+    // 都会被下面的 catch 吃掉，不会变成 effect 里的同步异常。
+    const load = async () => {
+      try {
+        const res = await hanaFetch('/api/speech-recognition/providers');
+        const data = await res.json();
+        // 用独立的「语音输入」开关判断，而不是「发送语音条时转录」——
+        // 两者是不同功能。字段缺失按开启处理（默认开）。
+        if (!cancelled) {
+          setSpeechInputEnabled(data?.config?.inputEnabled !== false);
+          setSpeechInputEngine(data?.config?.inputEngine || 'local');
+          setSpeechInputLocalModel(data?.config?.inputLocalModel || 'zh-14M');
+          // 云端批式专属模型：与作者的「语音条转录模型」无关，没配就是 null
+          const batchModel = data?.config?.inputBatchModel;
+          setSpeechInputBatchModel(
+            batchModel?.provider && batchModel?.id
+              ? { provider: String(batchModel.provider), id: String(batchModel.id) }
+              : null,
+          );
+          // 云端流式选中的实时模型：没配（或选了空）就交给服务端用默认型号
+          const cloudModel = data?.config?.inputCloudModel;
+          setSpeechInputCloudModel(
+            cloudModel?.provider && cloudModel?.id
+              ? { provider: String(cloudModel.provider), id: String(cloudModel.id) }
+              : null,
+          );
+        }
+      } catch {
+        if (!cancelled) setSpeechInputEnabled(false);
+      }
+    };
+    void load();
+    return () => { cancelled = true; };
+  }, [connected, settingsModalOpen]);
+
+  // 组件卸载（关窗口 / 切页面）：编辑器马上就没了，没法正常插入，
+  // 所以把还没提交的预览直接并进该会话的草稿里 —— 下次打开还能看到，不丢字。
+  // 然后收干净麦克风与识别流，避免麦克风指示灯不灭、连接泄漏。
+  useEffect(() => () => {
+    const ed = editor;
+    const key = speechDraftKeyRef.current;
+    if (speechActiveRef.current && ed && !ed.isDestroyed && key) {
+      const preview = speechPreviewKey.getState(ed.state)?.text ?? '';
+      if (preview) {
+        const state = useStore.getState() as any;
+        const prev = sessionScopedValue(state, state.drafts, key) || '';
+        setDraft(key, prev + preview, undefined);
+      }
+    }
+    stopSpeechAudio();
+    closeSpeechSession();
+  }, [closeSpeechSession, editor, setDraft, stopSpeechAudio]);
 
   // 切换 session / 回到首页 / 草稿 hydrate 完成时恢复草稿
   const draftsHydratedAt = useStore(s => s.draftsHydratedAt);
@@ -2301,6 +2647,9 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
             audioRecordingActive={audioRecordingState === 'recording'}
             audioRecordingBusy={audioRecordingState === 'starting' || audioRecordingState === 'stopping'}
             onAudioToggle={handleAudioRecordToggle}
+            speechInputEnabled={speechInputEnabled && !inputLocked}
+            speechInputActive={speechInputState === 'listening'}
+            onSpeechInputToggle={handleSpeechInputToggle}
             onSend={handleSend}
             onSteer={handleSteer}
             onStop={handleStop}

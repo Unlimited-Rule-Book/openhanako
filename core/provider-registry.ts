@@ -56,6 +56,8 @@ const MEDIA_USER_CONFIG_KEYS = {
   videoGeneration: "video_generation",
   speechGeneration: "speech_generation",
   speechRecognition: "speech_recognition",
+  // 实时（流式）语音识别：与批式分开的键，用户自行补充的流式模型写在 media.speech_recognition_streaming.models
+  speechRecognitionStreaming: "speech_recognition_streaming",
 };
 
 function isPlainObject(value) {

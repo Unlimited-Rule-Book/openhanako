@@ -4214,3 +4214,22 @@ html[data-platform="linux"] .onboarding {
 .drop-overlay {
     -webkit-app-region: no-drag;
 }
+
+/* ============================================================
+   语音输入的「预览层」
+
+   由 speech-preview-extension.ts 以 ProseMirror decoration 生成 ——
+   它属于编辑器 DOM 但不属于文档内容，所以拿不到 CSS Module 的类名，
+   必须写成全局类。
+
+   刻意做成"不确定"的样子（淡色 + 虚线底边）：这段文字还没定稿，
+   识别引擎随时可能改写，用户不该以为它已经写进去了。
+   ============================================================ */
+.speech-preview {
+    color: var(--text-muted);
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+    border-bottom: 1px dashed color-mix(in srgb, var(--accent) 45%, transparent);
+    white-space: pre-wrap;
+    pointer-events: none;
+    user-select: none;
+}

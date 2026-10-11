@@ -23,6 +23,25 @@ import { initDebugLog, createModuleLogger } from "../lib/debug-log.ts";
 import { redactLogLabel, redactLogText } from "../lib/log-redactor.ts";
 import { safeJson } from "./hono-helpers.ts";
 import { resolveSessionThinkingLevelState } from "./session-thinking-level-state.ts";
+import { createAsrSidecarManager } from "./asr-sidecar-manager.ts";
+import { createAsrCloudForwarder } from "./asr-cloud-forwarder.ts";
+import {
+  INPUT_ENGINES,
+  LOCAL_ASR_MODELS,
+  getLocalModel,
+  normalizeInputCloudModel,
+  normalizeInputEngine,
+  normalizeLocalModel,
+} from "../core/speech-recognition/input-engines.ts";
+import { DEFAULT_CLOUD_STREAM_MODEL_ID, DEFAULT_CLOUD_STREAM_PROVIDER_ID } from "../shared/speech-input.ts";
+import {
+  LOCAL_MODEL_SOURCES,
+  LOCAL_MODEL_SPECS,
+  resolveModelsRoot,
+  totalSizeOf,
+} from "../core/speech-recognition/local-models.ts";
+import { createAsrModelDownloader } from "./asr-model-downloader.ts";
+import { createAsrModelImporter } from "./asr-model-import.ts";
 
 const log = createModuleLogger("server");
 const checkpointLog = createModuleLogger("checkpoint");
@@ -579,6 +598,78 @@ export async function startServer(root: CompositionRoot = {}): Promise<void> {
   const app = new Hono();
   const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
 
+  // 本地语音识别 sidecar：按需拉起，只把端口暴露给本机渲染层。
+  // HANA_ROOT 由桌面主进程注入（dev 是仓库根，打包后是版本化服务目录），
+  // 兜底用 cwd，便于单独 `npm run server` 调试。
+  // 模型根目录：开发用仓库里的 tools/asr-sidecar/models；打包后用应用数据目录
+  // （安装目录可能只读且会被更新/卸载清掉）。可用 HANA_ASR_MODELS_ROOT 覆盖（测试用）。
+  const asrModelsRoot = resolveModelsRoot({
+    rootDir: process.env.HANA_ROOT || process.cwd(),
+    hanakoHome,
+    packaged: process.env.HANA_PACKAGED === "1",
+    env: process.env,
+  });
+
+  const asrSidecar = createAsrSidecarManager({
+    rootDir: process.env.HANA_ROOT || process.cwd(),
+    modelsRoot: asrModelsRoot,
+    log: (msg: string) => log.log(`[asr] ${msg}`),
+  });
+
+  // 模型下载器：与 sidecar 共用同一个模型根目录（否则下到别处后 sidecar 找不到）。
+  const asrModelImporter = createAsrModelImporter({
+    modelsRoot: asrModelsRoot,
+    log: (msg: string) => log.log(msg),
+    // 导入改变了模型文件 → 上次下载的结论（失败/取消）不再是当前状况的说明，作废它。
+    // 否则会出现"模型早已补齐、又被删掉，界面却说下载失败"这种指错原因的情况。
+    onFilesChanged: () => { asrModelDownloader.clearState(); },
+  });
+
+  const asrModelDownloader = createAsrModelDownloader({
+    modelsRoot: asrModelsRoot,
+    log: (msg: string) => log.log(msg),
+  });
+
+  // 云端语音识别转发器：渲染层连 /api/asr/cloud，服务端拿自己的 dashscope key 去连百炼。
+  // 降级由前端负责：云端连不上（没 key / 网络不通）时回退本地。
+  const getDashscopeApiKey = (): string | undefined => {
+    try {
+      return engine.providerRegistry?.getCredentials?.("dashscope")?.apiKey || undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const asrCloud = createAsrCloudForwarder({
+    getApiKey: getDashscopeApiKey,
+    log: (msg: string) => log.log(`[asr-cloud] ${msg}`),
+  });
+
+  /**
+   * 从"当前可用的流式语音模型"里挑一个能跑的。
+   *
+   * 优先级：设置里选中的 → 该能力声明里的默认型号 → 列表里第一个可用的。
+   * 这个顺序的意义是"总得挑一个出来"：
+   *   · 型号不能被渲染层随便指定（它可以直接发请求），只在服务端这张名单里挑；
+   *   · 用户没选（那行的空选项）或选中的已经不可用时，也要能继续工作。
+   * 名单本身跟着供应商配置走（凭据、用户手动加的模型），所以删了 Key 就挑不出来。
+   */
+  const resolveStreamingTarget = (streaming: any, wanted: { provider: string; id: string } | undefined) => {
+    const isAvailable = (providerId: string, modelId: string) =>
+      Boolean(streaming?.[providerId]?.models?.some((model: any) => model.id === modelId));
+    if (wanted && isAvailable(wanted.provider, wanted.id)) {
+      return { providerId: wanted.provider, modelId: wanted.id };
+    }
+    const preferredProvider = streaming?.[DEFAULT_CLOUD_STREAM_PROVIDER_ID];
+    if (preferredProvider?.models?.some((model: any) => model.id === DEFAULT_CLOUD_STREAM_MODEL_ID)) {
+      return { providerId: DEFAULT_CLOUD_STREAM_PROVIDER_ID, modelId: DEFAULT_CLOUD_STREAM_MODEL_ID };
+    }
+    for (const [providerId, provider] of Object.entries(streaming || {})) {
+      const first = (provider as any)?.models?.[0];
+      if (first) return { providerId, modelId: first.id };
+    }
+    return null;
+  };
+
   // CORS（默认允许 localhost 开发前端和 production Electron file:// 前端；HANA_CORS_ORIGIN 可收紧到单一来源）+ 鉴权
   const corsAllowedOrigin = process.env.HANA_CORS_ORIGIN;
   app.use("*", async (c: any, next: any) => {
@@ -1105,6 +1196,96 @@ export async function startServer(root: CompositionRoot = {}): Promise<void> {
     });
   });
 
+  // ── 本地语音识别 sidecar ──
+  // GET 只查状态；POST 幂等拉起（首次约 1 秒，之后再调即回）。
+  // 端口只对渲染层有意义：sidecar 自身只绑 127.0.0.1，且渲染层 CSP 已允许
+  // ws://127.0.0.1:*，所以渲染层直接连它、不必让服务端再做一层转发。
+  app.get("/api/asr/stream", async (c) => c.json(asrSidecar.status()));
+  app.post("/api/asr/stream", async (c) => {
+    const body = await safeJson(c);
+    const inputEngine = normalizeInputEngine(body?.engine);
+    if (inputEngine === "cloud") {
+      // 云端引擎经服务端转发，渲染层不直连云厂商（API Key 不下发）。
+      // 没配 key 时明确报错，让前端据此回退本地。
+      if (!getDashscopeApiKey()) {
+        return c.json({ engine: "cloud", error: "未配置百炼（DashScope）API Key" }, 503);
+      }
+      // 用哪个流式模型：由设置决定（config.inputCloudModel），但只在**服务端这张可用列表**里挑，
+      // 渲染层传来的值一律当"意向"而不是命令 —— 这样即使前端被改坏也塞不进任意型号。
+      const streaming = engine.speechRecognition?.listStreamingProviders?.() || {};
+      const target = resolveStreamingTarget(streaming, normalizeInputCloudModel(body?.cloudModel));
+      if (!target) {
+        return c.json({ engine: "cloud", error: "没有可用的流式语音模型，请检查供应商的 API Key 与模型配置" }, 503);
+      }
+      return c.json({
+        engine: "cloud",
+        model: target,
+        url: `/api/asr/cloud?provider=${encodeURIComponent(target.providerId)}&model=${encodeURIComponent(target.modelId)}`,
+      }, 200);
+    }
+    const modelDir = getLocalModel(normalizeLocalModel(body?.model))?.dir;
+    const status = await asrSidecar.ensureStarted(modelDir);
+    return c.json({ engine: "local", ...status }, status.ready ? 200 : 503);
+  });
+  // 引擎清单 + 本地模型清单：设置界面用它渲染「识别引擎 / 本地模型」选择器。
+  app.get("/api/asr/engines", async (c) => c.json({
+    engines: INPUT_ENGINES.map((e) => ({ id: e.id, label: e.label, capabilities: e.capabilities })),
+    localModels: LOCAL_ASR_MODELS.map((m) => ({ id: m.id, label: m.label })),
+  }));
+
+  // ── 本地识别模型：清单 / 安装状态 / 下载 ──
+  // 「识别引擎」那一行在这三种状态之间切换：未安装（给下载入口）→ 下载中（进度）→ 就绪（正常下拉）。
+  // 进度用**轮询**读（不新开事件通道）：这里只有设置界面的一个进度条，
+  // 轮询的代码量与出错面都比自建推送小得多。
+  app.get("/api/asr/models", async (c) => c.json({
+    modelsRoot: asrModelsRoot,
+    sources: LOCAL_MODEL_SOURCES,
+    specs: LOCAL_MODEL_SPECS.map((spec) => ({
+      id: spec.id,
+      role: spec.role,
+      dir: spec.dir,
+      totalBytes: totalSizeOf(spec.id),
+    })),
+    models: asrModelDownloader.modelStatus(),
+    download: asrModelDownloader.getState(),
+  }));
+
+  app.post("/api/asr/models/download", async (c) => {
+    const body = await safeJson(c);
+    const requested = Array.isArray(body?.ids) ? body.ids.map(String).filter(Boolean) : [];
+    // 不给 ids 就是"该装的都装"（识别模型 + 标点）
+    const ids = requested.length ? requested : LOCAL_MODEL_SPECS.map((spec) => spec.id);
+    // 真正在跑才拒绝。注意不能靠 start() 抛错来做这件事 ——
+    // start 是 async，抛错会变成被拒的 Promise（那层 catch 捕不到），
+    // 于是这个 409 会永远发不出去，用户点了"重试"却毫无反应。
+    if (asrModelDownloader.isRunning()) {
+      return c.json({ error: "已有模型下载在进行中" }, 409);
+    }
+    // 不 await：下载要在后台继续（用户可以离开这一页），进度靠上面的 GET 轮询
+    void asrModelDownloader
+      .start({ ids, sourceId: body?.sourceId ? String(body.sourceId) : null })
+      .catch((err: any) => log.log(`[asr-models] 启动失败：${err?.message || err}`));
+    return c.json({ ok: true, download: asrModelDownloader.getState() }, 202);
+  });
+
+  // 导入用户已有的模型文件。只收**路径**（渲染层用 Electron 的 getFilePath 拿到的真实路径），
+  // 服务端按内容指纹（大小 + sha256）认模型 —— 所以用户的文件/文件夹叫什么名字都不影响。
+  app.post("/api/asr/models/import", async (c) => {
+    const body = await safeJson(c);
+    const paths = Array.isArray(body?.paths) ? body.paths.map(String).filter(Boolean) : [];
+    if (!paths.length) return c.json({ error: "没有收到文件路径" }, 400);
+    try {
+      const outcome = await asrModelImporter.importPaths(paths);
+      return c.json({ ok: true, ...outcome });
+    } catch (err: any) {
+      return c.json({ error: err?.message || "导入失败" }, 500);
+    }
+  });
+
+  app.post("/api/asr/models/cancel", async (c) => c.json({ ok: asrModelDownloader.cancel() }));
+  // 下载结束（成功/失败/取消）后，界面点"知道了/重试"时清掉状态，回到"可以再点一次"
+  app.post("/api/asr/models/clear", async (c) => c.json({ ok: asrModelDownloader.clearState() }));
+
   // 远程关闭（供 desktop 端复用 server 退出时调用，跨平台可靠的 graceful shutdown）
   app.post("/api/shutdown", async (c) => {
     log.log("收到 HTTP shutdown 请求，正在清理...");
@@ -1126,6 +1307,35 @@ export async function startServer(root: CompositionRoot = {}): Promise<void> {
 
     server.on("upgrade", (req, socket, head) => {
       const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
+
+      // 云端语音识别转发端点：鉴权走和 /internal/browser 一样的链路。
+      if (url.pathname === "/api/asr/cloud") {
+        const cloudTransport = inferHttpConnectionKind({
+          hostHeader: req.headers.host,
+          remoteAddress: req.socket?.remoteAddress,
+          networkMode: serverRuntimeState.mode,
+        } as any);
+        if (!cloudTransport.connectionKind) {
+          socket.destroy();
+          return;
+        }
+        const cloudPrincipal = serverAuthService.authenticateRequest({
+          authorization: req.headers.authorization,
+          queryToken: url.searchParams.get("token"),
+          allowQueryToken: true,
+          connectionKind: cloudTransport.connectionKind,
+        });
+        const cloudAuthz = cloudPrincipal
+          ? authorizeHttpRoute({ method: "GET", path: url.pathname, principal: cloudPrincipal })
+          : null;
+        if (!cloudPrincipal || !cloudAuthz?.allowed) {
+          socket.destroy();
+          return;
+        }
+        asrCloud.handleUpgrade(req, socket, head);
+        return;
+      }
+
       if (url.pathname !== "/internal/browser") return; // let Hono handle it
 
       const transport = inferHttpConnectionKind({
@@ -1201,14 +1411,15 @@ export async function startServer(root: CompositionRoot = {}): Promise<void> {
       log.log("Electron browser control WS connected");
     });
 
-    // Inject Hono WS for chat and other WS routes, but skip /internal/browser
-    // to prevent double-handling the same upgrade request
+    // Inject Hono WS for chat and other WS routes, but skip the raw-ws endpoints
+    // (/internal/browser, /api/asr/cloud) to prevent double-handling the same
+    // upgrade request — both are handled by standalone WebSocketServers above.
     injectWebSocket({
       on(event: any, handler: any) {
         if (event === "upgrade") {
           server.on("upgrade", (req: any, socket: any, head: any) => {
             const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
-            if (url.pathname === "/internal/browser") return; // already handled above
+            if (url.pathname === "/internal/browser" || url.pathname === "/api/asr/cloud") return; // already handled above
             handler(req, socket, head);
           });
         } else {
@@ -1321,6 +1532,9 @@ export async function startServer(root: CompositionRoot = {}): Promise<void> {
 
       // 4. flush deferred result store（debounce 可能有未写盘的脏数据）
       engine.deferredResults?.dispose?.();
+
+      // 4.5 收掉语音识别 sidecar —— 它是我们拉起的子进程，不主动收会变孤儿
+      try { asrSidecar.stop(); } catch { /* 收尾失败不该阻断关闭流程 */ }
 
       // 5. 清理 Hub + 引擎（停 ticker → 等 tick 完成 → 关 DB → 清理 session）
       await hub.dispose();

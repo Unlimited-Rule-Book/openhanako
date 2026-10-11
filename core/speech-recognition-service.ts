@@ -1,8 +1,23 @@
 import { MediaAdapterRegistry } from "./media-adapter-registry.ts";
+import { IMPLEMENTED_STREAMING_ASR_PROTOCOLS } from "./media-protocols.ts";
 import { builtinSpeechRecognitionAdapters } from "./speech-recognition/adapters.ts";
+import {
+  DEFAULT_INPUT_ENGINE,
+  DEFAULT_LOCAL_MODEL_ID,
+  normalizeInputBatchModel,
+  normalizeInputCloudModel,
+  normalizeInputEngine,
+  normalizeLocalModel,
+} from "./speech-recognition/input-engines.ts";
 import { createModuleLogger } from "../lib/debug-log.ts";
 
 const CAPABILITY = "speech_recognition";
+/**
+ * 实时（流式）语音识别：与批式**分开的能力**。
+ * 批式 = 上传整段音频一次性转写；流式 = 边说边出字。
+ * 两者协议、事件模型、参数都不同，所以各自注册、各自出现在自己的选择入口。
+ */
+const STREAMING_CAPABILITY = "speech_recognition_streaming";
 
 function textOrNull(value) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
@@ -97,12 +112,67 @@ export class SpeechRecognitionService {
     }
     return {
       providers: next,
+      // 流式模型单独一段返回。设置界面拿它填「识别引擎」那一行，
+      // 与批式那段各走各的，互不干扰。
+      streamingProviders: this.listStreamingProviders(),
       config: this.getConfig(),
     };
   }
 
+  /**
+   * 列出「实时（流式）语音识别」能力下的可用模型。
+   *
+   * 与批式那套**完全同构**（同一个 providerRegistry、同一份凭据状态、同样的 adapterAvailable 过滤），
+   * 只是换了个能力键 —— 这就是"批式与流式各自注册"的落点：
+   * 一方加模型、删凭据、禁用供应商，都不会串到另一方。
+   *
+   * 只保留**有执行实现**的协议：声明了协议但还没写转发器的型号，列出来用户选了也跑不通，
+   * 不如不列（见 media-protocols.ts 的 IMPLEMENTED_STREAMING_ASR_PROTOCOLS）。
+   */
+  listStreamingProviders() {
+    const next: any = {};
+    for (const provider of this._providers.getMediaProviders(STREAMING_CAPABILITY) || []) {
+      const providerId = provider.providerId;
+      const models = (provider.models || [])
+        .map((model) => ({
+          ...model,
+          adapterAvailable: Boolean(model.protocolId)
+            && IMPLEMENTED_STREAMING_ASR_PROTOCOLS.has(model.protocolId)
+            && this.hasAdapterForModel(providerId, model),
+        }))
+        .filter((model) => model.adapterAvailable);
+      if (!models.length) continue;
+      const credentialStatus = this._providers.getMediaProviderCredentialStatus?.(providerId, STREAMING_CAPABILITY) || {};
+      next[providerId] = {
+        ...provider,
+        ...credentialStatus,
+        models,
+        availableModels: models.map((model) => ({
+          id: model.id,
+          name: model.displayName || model.name || model.id,
+        })),
+      };
+    }
+    return next;
+  }
+
+  /**
+   * 校验"这个流式模型能不能真的跑"。
+   * 服务端转发器用它挡住渲染层传来的任意 model 值：不在可用列表里的一律拒绝。
+   */
+  isRunnableStreamingModel(providerId: any, modelId: any) {
+    if (!providerId || !modelId) return false;
+    const providers = this.listStreamingProviders();
+    return Boolean(providers[providerId]?.models?.some((model) => model.id === modelId));
+  }
+
   getConfig() {
-    return this._prefs.getSpeechRecognitionConfig?.() || { enabled: false };
+    return this._prefs.getSpeechRecognitionConfig?.() || {
+      enabled: false,
+      inputEnabled: true,
+      inputEngine: DEFAULT_INPUT_ENGINE,
+      inputLocalModel: DEFAULT_LOCAL_MODEL_ID,
+    };
   }
 
   setConfig(patch) {
@@ -295,6 +365,32 @@ function normalizeSpeechRecognitionConfigPatch(patch, current: any = {}) {
   if (Object.prototype.hasOwnProperty.call(body, "enabled")) {
     next.enabled = body.enabled === true;
   }
+  // 输入框语音输入开关：与语音条转录彼此独立，默认开启。
+  // 注意它必须在下面两个 return 分支里都带上 —— 关掉语音条转录时不能把它一起丢掉。
+  if (Object.prototype.hasOwnProperty.call(body, "inputEnabled")) {
+    next.inputEnabled = body.inputEnabled !== false;
+  }
+  // 语音输入的引擎与本地模型：归一化，两个 return 分支都带（同上，不能因关掉转录而丢）
+  if (Object.prototype.hasOwnProperty.call(body, "inputEngine")) {
+    next.inputEngine = normalizeInputEngine(body.inputEngine);
+  }
+  if (Object.prototype.hasOwnProperty.call(body, "inputLocalModel")) {
+    next.inputLocalModel = normalizeLocalModel(body.inputLocalModel);
+  }
+  // 云端批式自己的转写模型：与作者的 defaultModel 分开存（两者是不同功能，不能耦合）。
+  // 传 null/undefined 表示清空。
+  if (Object.prototype.hasOwnProperty.call(body, "inputBatchModel")) {
+    const batchModel = normalizeInputBatchModel(body.inputBatchModel);
+    if (batchModel) next.inputBatchModel = batchModel;
+    else delete next.inputBatchModel;
+  }
+
+  // 云端流式选中的模型：同样与批式分开存
+  if (Object.prototype.hasOwnProperty.call(body, "inputCloudModel")) {
+    const cloudModel = normalizeInputCloudModel(body.inputCloudModel);
+    if (cloudModel) next.inputCloudModel = cloudModel;
+    else delete next.inputCloudModel;
+  }
   if (Object.prototype.hasOwnProperty.call(body, "defaultModel")) {
     const value = body.defaultModel;
     if (value === null || value === undefined) {
@@ -311,11 +407,22 @@ function normalizeSpeechRecognitionConfigPatch(patch, current: any = {}) {
   if (!next.enabled) {
     return {
       enabled: false,
+      inputEnabled: next.inputEnabled !== false,
+      inputEngine: normalizeInputEngine(next.inputEngine),
+      inputLocalModel: normalizeLocalModel(next.inputLocalModel),
+      ...(next.inputBatchModel ? { inputBatchModel: next.inputBatchModel } : {}),
+    ...(next.inputCloudModel ? { inputCloudModel: next.inputCloudModel } : {}),
+      ...(next.inputCloudModel ? { inputCloudModel: next.inputCloudModel } : {}),
       ...(next.defaultModel ? { defaultModel: next.defaultModel } : {}),
     };
   }
   return {
     enabled: true,
+    inputEnabled: next.inputEnabled !== false,
+    inputEngine: normalizeInputEngine(next.inputEngine),
+    inputLocalModel: normalizeLocalModel(next.inputLocalModel),
+    ...(next.inputBatchModel ? { inputBatchModel: next.inputBatchModel } : {}),
+    ...(next.inputCloudModel ? { inputCloudModel: next.inputCloudModel } : {}),
     ...(next.defaultModel ? { defaultModel: next.defaultModel } : {}),
   };
 }

@@ -138,11 +138,33 @@ export const volcengineSpeechRecognitionAdapter = {
   },
 };
 
+/**
+ * 「实时（流式）语音识别」的适配器**声明**。
+ *
+ * 这里只声明"这个协议存在"，不实现执行逻辑 —— 真正的流式执行在服务端转发器
+ * `server/asr-cloud-forwarder.ts`：渲染层连本机 ws，服务端拿自己的 key 去连百炼，
+ * 双向转发音频帧与识别结果，把厂商事件映射成 partial / endpoint / final。
+ *
+ * 为什么仍然要在这里登记：注册表用"模型声明的 protocolId 能否解析到适配器"
+ * 来判断该模型在当前能力下是否可用（见 SpeechRecognitionService.hasAdapterForModel）。
+ * 不登记的话，speechRecognitionStreaming 能力下的模型会被**全部过滤掉**，界面上一个都不显示。
+ *
+ * 这也正是"批式与流式各自注册"的落点：两种能力各有各的协议与适配器，
+ * 谁也不会串到对方的选择列表里。
+ */
+export const dashscopeRealtimeSpeechRecognitionAdapter = {
+  id: "dashscope-paraformer-realtime",
+  name: "DashScope Realtime Speech Recognition (server-forwarded)",
+  protocolId: "dashscope-paraformer-realtime",
+  types: ["speechRecognitionStreaming"],
+};
+
 export const builtinSpeechRecognitionAdapters = [
   openaiSpeechRecognitionAdapter,
   mimoSpeechRecognitionAdapter,
   dashscopeSpeechRecognitionAdapter,
   volcengineSpeechRecognitionAdapter,
+  dashscopeRealtimeSpeechRecognitionAdapter,
 ];
 
 function resolveFetch(input) {

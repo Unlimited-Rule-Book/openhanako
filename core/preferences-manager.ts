@@ -48,6 +48,7 @@ import {
 import { createModuleLogger } from "../lib/debug-log.ts";
 import { isValidAgentId } from "../shared/agent-id.ts";
 import { normalizeSessionThinkingLevel } from "./session-thinking-level.ts";
+import { normalizeInputBatchModel, normalizeInputCloudModel, normalizeInputEngine, normalizeLocalModel } from "./speech-recognition/input-engines.ts";
 
 const log = createModuleLogger("preferences");
 const RETIRED_EXPERIMENT_IDS = new Set([
@@ -841,6 +842,18 @@ export class PreferencesManager {
       : null;
     return {
       enabled: raw?.enabled === true,
+      // 输入框语音输入：独立于语音条转录，默认开启（只有显式存过 false 才关）
+      inputEnabled: raw?.inputEnabled !== false,
+      // 语音输入的引擎与本地模型：归一化，脏值一律退回默认
+      inputEngine: normalizeInputEngine(raw?.inputEngine),
+      inputLocalModel: normalizeLocalModel(raw?.inputLocalModel),
+      // 云端批式自己的转写模型（与作者的 defaultModel 分开存）
+      ...(normalizeInputBatchModel(raw?.inputBatchModel)
+        ? { inputBatchModel: normalizeInputBatchModel(raw?.inputBatchModel) }
+        : {}),
+      ...(normalizeInputCloudModel(raw?.inputCloudModel)
+        ? { inputCloudModel: normalizeInputCloudModel(raw?.inputCloudModel) }
+        : {}),
       ...(defaultModel?.provider && defaultModel.id ? { defaultModel } : {}),
     };
   }
@@ -849,6 +862,15 @@ export class PreferencesManager {
     const prefs = this._mutableCopy();
     const next = {
       enabled: config?.enabled === true,
+      inputEnabled: config?.inputEnabled !== false,
+      inputEngine: normalizeInputEngine(config?.inputEngine),
+      inputLocalModel: normalizeLocalModel(config?.inputLocalModel),
+      ...(normalizeInputBatchModel(config?.inputBatchModel)
+        ? { inputBatchModel: normalizeInputBatchModel(config?.inputBatchModel) }
+        : {}),
+      ...(normalizeInputCloudModel(config?.inputCloudModel)
+        ? { inputCloudModel: normalizeInputCloudModel(config?.inputCloudModel) }
+        : {}),
       ...(config?.defaultModel?.provider && config?.defaultModel?.id ? {
         defaultModel: {
           provider: config.defaultModel.provider,

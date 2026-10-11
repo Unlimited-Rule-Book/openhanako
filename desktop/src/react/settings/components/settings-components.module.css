@@ -239,7 +239,14 @@
 /* stacked row 本身自带足够高度（label + hint + control），无需和邻居再画分隔线
  * divider 只用于 inline row 之间（行高扁，需要线分区） */
 .row.rowStacked + .row::before,
-.row + .row.rowStacked::before {
+.row + .row.rowStacked::before,
+.row.rowInlineHint + .row::before {
+    display: none;
+}
+
+/* 显式关掉某一行上方的分隔线（见 SettingsRow 的 divider prop）。
+ * 选择器写成 .row.rowNoDivider 是为了压过上面那条 .row + .row::before 的优先级。 */
+.row.rowNoDivider::before {
     display: none;
 }
 
@@ -253,6 +260,21 @@
 .rowStacked {
     display: flex;
     flex-direction: column;
+    gap: var(--space-16);
+}
+
+/* 标题行：label 与 control 同一行（control 靠右），hint 整行铺在下面。
+ * 用于「语音输入」这种"开关要和标题对齐、说明文字又要占满一行"的设置项。 */
+.rowInlineHint {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+}
+
+.rowHead {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
     gap: var(--space-16);
 }
 

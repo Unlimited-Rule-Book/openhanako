@@ -8066,3 +8066,55 @@ a.about-link:hover {
 .settings-toast {
     -webkit-app-region: no-drag;
 }
+
+/*
+ * 本地模型下载：只在「识别引擎」那一行及它下面出现。
+ * 用按钮而不是下拉，是因为这三种状态（未安装 / 下载中 / 失败）本来就不是"选项"。
+ */
+.asrModelDownloadButton {
+    padding: var(--space-4) var(--space-12);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-input, 6px);
+    background: var(--bg-secondary, transparent);
+    color: var(--text-primary);
+    font-size: 13px;
+    cursor: pointer;
+}
+
+.asrModelDownloadButton:hover {
+    border-color: var(--text-secondary);
+}
+
+.asrModelProgress {
+    font-size: 13px;
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
+}
+
+.asrModelHint {
+    font-size: 12px;
+    color: var(--text-muted);
+    word-break: break-all;
+}
+
+.asrModelRowActions {
+    display: flex;
+    gap: var(--space-8);
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
+/* ── 二级面板：导入用户已有的模型文件 ──
+   拖拽区要一眼看出"这里可以放东西"，所以用虚线框 + 明确的提示文字。 */
+.asrModelDropZone {
+    border: 1px dashed var(--border);
+    border-radius: var(--radius-card, 8px);
+    padding: var(--space-16);
+    text-align: center;
+    transition: border-color var(--duration-fast) var(--ease-out), background-color var(--duration-fast) var(--ease-out);
+}
+
+.asrModelDropZoneActive {
+    border-color: var(--text-secondary);
+    background: var(--bg-secondary, transparent);
+}

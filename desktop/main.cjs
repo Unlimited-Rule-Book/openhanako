@@ -1754,6 +1754,10 @@ async function _spawnServerOnce(serverInfoPath, artifactBootContext) {
       ? [path.join(versionedServerRoot, "bootstrap.js")]
       : [];
     serverEnv.HANA_ROOT = versionedServerRoot;
+    // 显式告诉服务端"这是打包环境"：模型这类**要联网下载、且需要可写目录**的数据
+    // 必须放到应用数据目录，不能落在安装目录里（那里可能只读，更新/卸载还会清掉）。
+    // 注意不能靠"目录存不存在"去猜 —— 打包产物里同样有 tools/asr-sidecar/，只是没有 models。
+    serverEnv.HANA_PACKAGED = "1";
     serverEnv.HANA_SERVER_ENTRY = entry;
     // Desktop renderer starts in pending-new-session mode; chat session warmup
     // must not block the HTTP server readiness handshake.

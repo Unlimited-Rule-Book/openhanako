@@ -6,6 +6,7 @@ import { SkillBadge } from './extensions/skill-badge';
 import { FileBadge } from './extensions/file-badge';
 import { SessionBadge } from './extensions/session-badge';
 import { AgentBadge } from './extensions/agent-badge';
+import { SpeechPreviewExtension } from './speech-preview-extension';
 
 export type InputEditorPlaceholder = PlaceholderOptions['placeholder'];
 
@@ -32,5 +33,7 @@ export function createInputEditorExtensions(placeholder: InputEditorPlaceholder)
     FileBadge,
     SessionBadge,
     AgentBadge,
+    // 语音输入的预览层：只画不改文档，见 speech-preview-extension.ts
+    SpeechPreviewExtension,
   ];
 }

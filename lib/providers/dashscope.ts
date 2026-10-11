@@ -143,6 +143,22 @@ export const dashscopePlugin = {
           { id: "qwen3-asr-flash", displayName: "Qwen3 ASR Flash", protocolId: "dashscope-qwen-asr-chat", inputs: ["audio"], outputs: ["text"] },
         ],
       },
+      // 实时（流式）语音识别 —— 与上面的 speechRecognition（批式）是**两种能力**：
+      // 批式是 HTTP 一次性上传整段音频，流式是 WebSocket 双向收发。
+      // 协议、事件模型、参数都不同，所以各自注册、各自出现在不同的选择入口。
+      // 流式的实际执行在 server/asr-cloud-forwarder.ts（服务端转发，API Key 不下发渲染层）。
+      //
+      // 这三个型号与转发器依赖的事件结构（payload.output.sentence.text / .sentence_end）同构，
+      // 可以直接用；会话式的 qwen3-asr-flash-realtime / qwen3.5-omni-*-realtime 事件名完全不同，
+      // 不在 inferMediaProtocolId 的匹配范围内（会被判为无协议，因此不出现在列表里）。
+      speechRecognitionStreaming: {
+        defaultModelId: "paraformer-realtime-v2",
+        models: [
+          { id: "paraformer-realtime-v2", displayName: "Paraformer Realtime v2", protocolId: "dashscope-paraformer-realtime", inputs: ["audio"], outputs: ["text"] },
+          { id: "fun-asr-realtime", displayName: "Fun-ASR Realtime", protocolId: "dashscope-paraformer-realtime", inputs: ["audio"], outputs: ["text"] },
+          { id: "qwen-audio-3.0-asr-flash-streaming", displayName: "Qwen-Audio 3.0 ASR Flash Streaming", protocolId: "dashscope-paraformer-realtime", inputs: ["audio"], outputs: ["text"] },
+        ],
+      },
     },
   },
 };

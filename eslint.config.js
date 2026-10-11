@@ -59,6 +59,7 @@ export default [
       'plugins/**/*.{js,ts}',
       'scripts/**/*.{js,mjs,ts}',
       'tools/npm-ea/**/*.mjs',
+      'tools/asr-sidecar/**/*.mjs',
       'server/**/*.{js,ts}',
       'shared/**/*.{js,ts}',
       'tests/**/*.{js,ts,tsx}',
