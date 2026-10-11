@@ -283,8 +283,34 @@
     50% { opacity: 0.35; transform: scale(0.7); }
 }
 
+/* connecting：引擎还在起（首次要拉起 sidecar + 加载模型，可能几秒）。
+   这期间**没有在录音**，所以不能沿用「聆听中」的绿色 —— 那会让人以为已经在听了。
+   换成中性色 + 更慢的呼吸，明确表达「在准备，还没开始」。 */
+.speech-input-btn.is-connecting,
+.speech-input-btn.is-transcribing {
+    --speech-pulse-duration: 2s;
+    color: var(--text-secondary);
+    background: color-mix(in srgb, var(--text-secondary) 8%, transparent);
+    border-color: color-mix(in srgb, var(--text-secondary) 30%, transparent);
+}
+
+/* 可见状态文字。只有 tooltip 是不够的 —— 没人会为了知道「在准备」去悬停按钮。 */
+.speech-status-text {
+    font-size: 12px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    margin-right: var(--space-6);
+    animation: speech-status-in var(--duration-slow) ease-out;
+}
+
+@keyframes speech-status-in {
+    from { opacity: 0; transform: translateX(4px); }
+    to { opacity: 1; transform: none; }
+}
+
 @media (prefers-reduced-motion: reduce) {
     .speech-input-live-dot { animation: none; }
+    .speech-status-text { animation: none; }
 }
 
 /* ── Context Usage Ring ── */

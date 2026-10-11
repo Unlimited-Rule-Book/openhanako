@@ -24,6 +24,8 @@ export interface InputEngine {
   capabilities: InputEngineCapabilities;
 }
 
+import { getLocalModelSpec } from './local-models.ts';
+
 export interface LocalAsrModel {
   id: string;
   label: string;
@@ -31,10 +33,17 @@ export interface LocalAsrModel {
   dir: string;
 }
 
+/**
+ * 本地识别模型的**展示信息**。
+ *
+ * dir 不在这里重复写一份 —— 目录名由 local-models.ts 的清单统一持有。
+ * 两处各写一份迟早漂移（改了一处、另一处还是老名字，sidecar 就找不到模型了）。
+ */
 export const LOCAL_ASR_MODELS: LocalAsrModel[] = [
-  { id: 'zh-14M', label: '中文 14M（默认，最快）', dir: 'sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23' },
-  { id: 'bilingual', label: '中英双语', dir: 'sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20' },
-];
+  { id: 'zh-14M', label: '中文 14M（默认，最快）' },
+  { id: 'bilingual', label: '中英双语' },
+].map((model) => ({ ...model, dir: getLocalModelSpec(model.id)?.dir ?? model.id }));
+
 
 export const DEFAULT_LOCAL_MODEL_ID = 'zh-14M';
 
@@ -42,7 +51,9 @@ export const INPUT_ENGINES: InputEngine[] = [
   {
     id: 'local',
     label: '本地（免费、不联网）',
-    capabilities: { streaming: true, punctuation: false, itn: false, languages: ['zh', 'en'] },
+    // sidecar 里这两件事都做了（标点走离线标点模型、数字规整走 itn-zh.mjs）。
+    // 声明成 false 会让前端按「没有标点 / 没有规整」去渲染和处理 —— 与实际能力不符。
+    capabilities: { streaming: true, punctuation: true, itn: true, languages: ['zh', 'en'] },
   },
   {
     id: 'cloud',

@@ -36,6 +36,8 @@ interface Props {
   // 那个走"原生音频模型 + 录音发语音条"，这个走"语音识别 + 流式写入输入框"。
   speechInputEnabled: boolean;
   speechInputActive: boolean;
+  /** 语音输入的细分阶段：connecting/listening/transcribing 时按钮都可点，但标题要说清当前在干什么 */
+  speechInputPhase?: 'idle' | 'connecting' | 'listening' | 'transcribing';
   onSpeechInputToggle: () => void;
   onSend: () => void;
   onSteer: () => void;
@@ -50,7 +52,7 @@ export const InputControlBar = memo(function InputControlBar(props: Props) {
     showThinking, thinkingLevel, onThinkingChange, availableThinkingLevels,
     models, sessionModel, isStreaming, hasInput, canSend,
     showAudioInput, audioRecordingActive, audioRecordingBusy, onAudioToggle,
-    speechInputEnabled, speechInputActive, onSpeechInputToggle,
+    speechInputEnabled, speechInputActive, speechInputPhase, onSpeechInputToggle,
     onSend, onSteer, onStop,
   } = props;
 
@@ -81,12 +83,38 @@ export const InputControlBar = memo(function InputControlBar(props: Props) {
         <ContextRing />
       </div>
       <div className={styles['input-controls']}>
+        {/* 可见状态文字：只在「还没开始录 / 正在出结果」这两种**光看按钮看不出来**的阶段显示。
+            聆听中不显示 —— 那时按钮已经变绿并跳动，再挂一行字纯属噪声。 */}
+        {speechInputEnabled && (speechInputPhase === 'connecting' || speechInputPhase === 'transcribing') && (
+          <span className={styles['speech-status-text']} role="status" aria-live="polite">
+            {t(speechInputPhase === 'connecting' ? 'input.speechLoadingModel' : 'input.speechTranscribing')}
+          </span>
+        )}
         {speechInputEnabled && (
           <button
             type="button"
-            className={`${styles['speech-input-btn']}${speechInputActive ? ` ${styles['is-listening']}` : ''}`}
-            title={t(speechInputActive ? 'input.stopSpeechInput' : 'input.startSpeechInput')}
-            aria-label={t(speechInputActive ? 'input.stopSpeechInput' : 'input.startSpeechInput')}
+            className={[
+              styles['speech-input-btn'],
+              speechInputPhase === 'listening' ? styles['is-listening'] : '',
+              // connecting / transcribing 用中性色 + 慢呼吸：此时并没有在录音，
+              // 沿用绿色会让用户以为已经在听了
+              speechInputPhase === 'connecting' || speechInputPhase === 'transcribing'
+                ? styles['is-connecting']
+                : '',
+            ].filter(Boolean).join(' ')}
+            // 按阶段给标题：connecting 说「正在加载模型…」（还没录音，说「停止」会让人误会已录上）；
+            // transcribing 说「正在转写…」（采集已停、引擎在出结果）。两种情况按钮都仍可点 ——
+            // 点了就是取消/立刻收尾，不会把用户卡住。
+            title={t(speechInputPhase === 'connecting'
+              ? 'input.speechLoadingModel'
+              : speechInputPhase === 'transcribing'
+                ? 'input.speechTranscribing'
+                : (speechInputActive ? 'input.stopSpeechInput' : 'input.startSpeechInput'))}
+            aria-label={t(speechInputPhase === 'connecting'
+              ? 'input.speechLoadingModel'
+              : speechInputPhase === 'transcribing'
+                ? 'input.speechTranscribing'
+                : (speechInputActive ? 'input.stopSpeechInput' : 'input.startSpeechInput'))}
             aria-pressed={speechInputActive}
             onClick={onSpeechInputToggle}
           >

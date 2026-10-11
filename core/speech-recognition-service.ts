@@ -411,7 +411,6 @@ function normalizeSpeechRecognitionConfigPatch(patch, current: any = {}) {
       inputEngine: normalizeInputEngine(next.inputEngine),
       inputLocalModel: normalizeLocalModel(next.inputLocalModel),
       ...(next.inputBatchModel ? { inputBatchModel: next.inputBatchModel } : {}),
-    ...(next.inputCloudModel ? { inputCloudModel: next.inputCloudModel } : {}),
       ...(next.inputCloudModel ? { inputCloudModel: next.inputCloudModel } : {}),
       ...(next.defaultModel ? { defaultModel: next.defaultModel } : {}),
     };

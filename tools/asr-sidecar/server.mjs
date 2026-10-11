@@ -53,6 +53,28 @@ const DEFAULT_MODEL_DIR = path.join(
 const DEFAULT_PORT = 8766;
 const SAMPLE_RATE = 16000;
 
+const LOOPBACK_WEB_ORIGIN = /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/;
+
+/**
+ * WS 来源校验：只接受本机前端。口径与 server/http/cors-policy.ts 保持一致 ——
+ *   · file://（Electron 生产前端）、null、loopback（开发前端）放行；
+ *   · 没有 Origin 头也放行：浏览器发起的连接一定带 Origin，缺这个头只可能是
+ *     本机 node 客户端（例如服务端自己的探活），不算跨站请求；
+ *   · 其余来源一律拒绝 —— 否则任意网页都能用一行 JS 连上本机识别服务。
+ *
+ * file:// 用**前缀**判定而不是精确等于 "file://"：本地 HTML 文档的 Origin 还可能
+ * 带上完整路径（如 "file:///D:/app/index.html"），精确匹配会把这些漏掉。
+ * 放宽到前缀不会引入跨站风险 —— Origin 由浏览器填写、脚本无法伪造，远程网页只会带
+ * 自己的 http(s) 源，永远变不成 file://。导出仅为单元测试可直接引用（不影响直接运行）。
+ */
+export function isAllowedOrigin(origin) {
+  const value = String(origin ?? '');
+  if (!value) return true;
+  if (value === 'null') return true;
+  if (value === 'file://' || value.startsWith('file:///')) return true;
+  return LOOPBACK_WEB_ORIGIN.test(value);
+}
+
 /** 建一个识别器。14M 小模型单线程反而最快（多线程同步开销大于收益）。 */
 export function createRecognizer({
   modelDir = DEFAULT_MODEL_DIR,
@@ -113,32 +135,62 @@ const PUNCT_MODEL_DIR = 'sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024
  */
 function createFinalizer({ modelsRoot, punctuation = 'auto', itn = 'auto', log = () => {} }) {
   let punct = null;
-  let punctTried = false;
+  // "这份标点模型加载失败过"的指纹 = mtime + size。
+  // 为什么要记指纹、而不是简单记一个布尔"失败过"：用户可能稍后重新下载 / 换掉这个
+  // 模型文件，只要文件内容变了就必须允许再试一次；只记布尔会把一次坏文件的失败
+  // 变成永久结论（表现为"换了好模型也不生效"）。
+  // 为什么要记（而不是每次重试）：标点模型构造要几秒，文件存在但构造抛错时，
+  // 老实现每句 finalize 都会重试一遍 → 每句都卡一次。记下指纹后，同一份文件只失败
+  // 一次。启动预热（startServer 就绪前调用一次）失败同样落到这里，所以预热失败也
+  // 不会被每句重复触发。
+  // 注意：文件**不存在**的情况不写指纹 —— 那会退化成"缺模型 = 永久不重试"，
+  // 与"用户稍后下载就能生效"的既有语义冲突（见下）。
+  let failedFingerprint = null;
 
-  function getPunct() {
-    if (punctTried) return punct;
-    punctTried = true;
+  /**
+   * 加载标点模型（约 294MB，构造要几秒）。
+   *
+   * 缓存规则：
+   *   1. 加载**成功** → 缓存 punct，后续直接复用（不动）。
+   *   2. 文件**不存在** → 不缓存（保留既有语义）：每次都重新查一次路径，用户稍后
+   *      下载 / 导入模型后即可生效（stat 很便宜，不缺这点开销）。
+   *   3. 文件存在但**构造失败** → 记下该文件的 mtime+size 指纹；同一份文件不再重试、
+   *      日志也只打一次。文件变了（指纹改变）才允许重试。
+   */
+  function loadPunctuation() {
     if (punctuation === 'off') return null;
+    if (punct) return punct;
     // 注意：标点模型放在 models 根目录下，**不是** ASR 模型目录里 ——
     // 这里一开始写成了 path.join(modelDir, ...)，导致永远找不到模型、静默跳过标点。
     const modelPath = path.join(modelsRoot, PUNCT_MODEL_DIR, 'model.onnx');
-    if (!fs.existsSync(modelPath)) {
+    let stat;
+    try {
+      stat = fs.statSync(modelPath);
+    } catch {
+      // 不存在：不打失败指纹，保持"下次仍会重新检查"的语义。
       log(`未找到标点模型，跳过标点（路径：${modelPath}）`);
+      return null;
+    }
+    const fingerprint = `${stat.mtimeMs}:${stat.size}`;
+    if (failedFingerprint === fingerprint) {
+      // 同一份文件刚刚已经失败过：不重试、不重复打日志，避免每句都卡一次。
       return null;
     }
     try {
       const t0 = Date.now();
       // 词表嵌在 onnx 元数据里，不需要额外的 tokens 文件
       punct = new sherpa.OfflinePunctuation({ model: { ctTransformer: modelPath, numThreads: 1, provider: 'cpu' } });
+      failedFingerprint = null;
       log(`标点模型已加载（${Date.now() - t0}ms）`);
     } catch (err) {
+      failedFingerprint = fingerprint;
       log(`标点模型加载失败，跳过标点：${err.message}`);
       punct = null;
     }
     return punct;
   }
 
-  return function finalize(raw) {
+  function finalize(raw) {
     const text = String(raw ?? '').trim();
     if (!text) return text;
     let out = text;
@@ -146,13 +198,17 @@ function createFinalizer({ modelsRoot, punctuation = 'auto', itn = 'auto', log =
       try { out = normalizeChineseNumbers(out); } catch { /* 规整失败就用原文，绝不丢字 */ }
     }
     if (punctuation !== 'off') {
-      const p = getPunct();
+      const p = loadPunctuation();
       if (p) {
         try { out = p.addPunct(out); } catch { /* 标点失败就用原文 */ }
       }
     }
     return out;
-  };
+  }
+
+  // loadPunctuation 单独暴露：启动时要主动预热（见 startServer），
+  // 不能等到第一句话说完才加载，那会让首句卡顿。
+  return { finalize, loadPunctuation };
 }
 
 /** 一条连接对应一条识别流。 */
@@ -252,8 +308,17 @@ export function startServer({
   log = () => {},
 } = {}) {
   const recognizer = createRecognizer({ modelDir, numThreads, trailingSilence, maxUtterance });
-  const finalize = createFinalizer({ modelsRoot: MODELS_ROOT, punctuation, itn, log });
-  const wss = new WebSocketServer({ host, port });
+  const { finalize, loadPunctuation } = createFinalizer({ modelsRoot: MODELS_ROOT, punctuation, itn, log });
+  // 在宣布"就绪"之前就把标点模型加载好。它是 ~294MB 的大模型，构造要几秒；
+  // 若留到第一句话结束才同步加载，首句会明显卡顿（就绪行之前前端不会开始录音，
+  // 所以在这里一次性吃掉这段延迟是安全的）。
+  loadPunctuation();
+  const wss = new WebSocketServer({
+    host,
+    port,
+    // 挡掉跨站网页的连接尝试，只放行本机前端（详见 isAllowedOrigin）。
+    verifyClient: (info) => isAllowedOrigin(info.origin),
+  });
 
   wss.on('connection', (ws) => {
     let session = null;
@@ -285,6 +350,10 @@ export function startServer({
       }
       switch (msg?.type) {
         case 'start':
+          // 重复 start（前端重录 / 断线重连）会直接覆盖 session 变量，
+          // 旧 session 的原生 stream 不释放就会泄漏（native 内存 + 残留解码状态）。
+          // 先把旧的收掉，再开新的。
+          session?.dispose();
           session = createSession(recognizer, send, finalize);
           session.start(msg.sampleRate ?? SAMPLE_RATE);
           break;
@@ -353,10 +422,22 @@ if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) 
     log: (m) => console.log(`[asr-sidecar] ${m}`),
   });
 
+  // stdin 是父进程（Hana 服务端）握着的"生命线"管道。应用被强杀时父进程来不及
+  // 发 SIGTERM，但它一死，管道的写端就关闭，我们这里会收到 EOF —— 借此主动退出，
+  // 免得 sidecar 抱着几百 MB 模型内存变成孤儿进程。
+  // 注意：必须 resume()，stdin 默认是暂停的，不恢复流动就永远收不到 'end'。
+  process.stdin.on('end', () => process.exit(0));
+  process.stdin.on('close', () => process.exit(0));
+  process.stdin.resume();
+
   // 必须在 listening 之后才读端口：构造后立刻读会拿到 null（port 0 时拿到 0），
   // 父进程就会连到一个无效端口。这个坑是被 tests/asr-sidecar-manager.test.ts 抓到的。
   const report = () => {
     const actualPort = server.wss.address()?.port ?? port;
+    // 机器可读的就绪行。父进程**优先**认这一行 —— 靠下面那句人类可读文案判定就绪，
+    // 只要文案改一个字（翻译、措辞、加个括号）就悄悄失效，而且失效方式是"卡住等超时"，
+    // 排查起来要翻到 manager 的正则才知道为什么。
+    console.log(JSON.stringify({ asrSidecarReady: true, port: actualPort }));
     console.log(`[asr-sidecar] 模型加载完成（${Date.now() - t0}ms），监听 ws://127.0.0.1:${actualPort}`);
     console.log(`[asr-sidecar] 后处理：数字规整=${itn} 标点=${punctuation}`);
   };

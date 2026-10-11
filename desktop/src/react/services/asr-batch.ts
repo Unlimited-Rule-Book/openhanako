@@ -15,6 +15,14 @@
 import { hanaFetch } from '../hooks/use-hana-fetch';
 import { SPEECH_SAMPLE_RATE, type AsrStreamHandlers, type AsrStreamSession } from './asr-stream';
 
+/**
+ * 批式录音的最长时长（毫秒）。这是**真实约束**而非体验取舍：
+ * 批式是把整段 PCM 一直攒在内存里、最后编码成一个 WAV 一次性上传并转写，
+ * 不像流式那样边收边发。没有上限的话，用户忘了停就会一直涨内存、上传也越来越大。
+ * 界面侧的自动停止计时器与本值共用同一个常量（见 InputArea）。
+ */
+export const MAX_BATCH_RECORDING_MS = 5 * 60_000;
+
 /** 把累积的 int16 分片编成 WAV（云端要的是文件，不是裸 PCM） */
 function encodeWavBlob(chunks: Int16Array[], sampleRate: number): Blob {
   const totalSamples = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
@@ -78,6 +86,9 @@ export function createBatchAsrSession({
 }): AsrStreamSession {
   const chunks: Int16Array[] = [];
   let aborted = false;
+  // 已经攒下的采样点数，用来给内存加硬上限（见 MAX_BATCH_RECORDING_MS）。
+  const maxSamples = Math.round((MAX_BATCH_RECORDING_MS / 1000) * sampleRate);
+  let totalSamples = 0;
 
   async function transcribe(): Promise<void> {
     if (sessionPath == null || sessionPath === '') {
@@ -149,7 +160,15 @@ export function createBatchAsrSession({
   return {
     sendPcm(data) {
       if (aborted) return;
-      chunks.push(new Int16Array(data));
+      // 硬上限：即便界面层的自动停止计时器没来得及触发（切后台时浏览器会节流
+      // setTimeout），这里也不再继续攒，避免内存无上限增长。超出的音频直接丢掉，
+      // 因为"整段上传"这条路本来就不该录这么久。
+      if (totalSamples >= maxSamples) return;
+      const chunk = new Int16Array(data);
+      const remaining = maxSamples - totalSamples;
+      const accepted = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
+      totalSamples += accepted.length;
+      chunks.push(accepted);
     },
     finish() {
       // finish 是同步接口（流式那边只是发个 end），这里把异步转写兜住，

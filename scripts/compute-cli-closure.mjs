@@ -231,6 +231,12 @@ export const DYNAMIC_CALL_ALLOWLIST = Object.freeze([
       + "in code already covered by that explicit declared root.",
   },
   {
+    file: "server/asr-sidecar-manager.ts",
+    callee: "spawn",
+    argText: "process.execPath",
+    reason: "The local speech-recognition sidecar (tools/asr-sidecar/server.mjs) runs in a separate Node process on purpose: a native ASR engine abort must not take the server down with it, and the model resident in memory must be decoupled from the HTTP server lifetime. process.execPath is whatever Node runtime already runs this process (the repo's Node in development, the distributed runtime in packaged mode) -- an environment-provided binary, not repo source to trace into the CLI closure; the sidecar's own source ships via the tools/ build scripts.",
+  },
+  {
     file: "core/fresh-import.ts",
     callee: "import",
     argText: "url.href",

@@ -622,7 +622,13 @@ export async function startServer(root: CompositionRoot = {}): Promise<void> {
     log: (msg: string) => log.log(msg),
     // 导入改变了模型文件 → 上次下载的结论（失败/取消）不再是当前状况的说明，作废它。
     // 否则会出现"模型早已补齐、又被删掉，界面却说下载失败"这种指错原因的情况。
-    onFilesChanged: () => { asrModelDownloader.clearState(); },
+    onFilesChanged: () => {
+      asrModelDownloader.clearState();
+      // 刚下载/导入完模型，可能正好补上了 sidecar 启动时缺的那几个文件
+      //（标点模型就是典型：缺了它 sidecar 会「这一次没有」地跳过）。
+      // 收掉进程，下次使用时会带着新文件重新起来 —— 否则用户得自己重启应用才生效。
+      asrSidecar.stop();
+    },
   });
 
   const asrModelDownloader = createAsrModelDownloader({
@@ -1329,6 +1335,26 @@ export async function startServer(root: CompositionRoot = {}): Promise<void> {
           ? authorizeHttpRoute({ method: "GET", path: url.pathname, principal: cloudPrincipal })
           : null;
         if (!cloudPrincipal || !cloudAuthz?.allowed) {
+          socket.destroy();
+          return;
+        }
+        // 校验前端传来的 model。HTTP 侧（/api/asr/stream）本来就会校验，
+        // 但这个 ws 端点可以被直连绕过 —— 那样非法型号会被原样转发给上游，
+        // 用户看到的是上游的报错，而不是「这个模型不可用」。
+        // isRunnableStreamingModel 本来就是为这件事写的（见它的注释），只是一直没人调用。
+        const requestedProvider = url.searchParams.get("provider") || "";
+        const requestedModel = url.searchParams.get("model") || "";
+        let runnable = false;
+        try {
+          runnable = Boolean(engine.speechRecognition?.isRunnableStreamingModel?.(
+            requestedProvider,
+            requestedModel,
+          ));
+        } catch {
+          runnable = false;
+        }
+        if (!runnable) {
+          log.log(`[asr-cloud] 拒绝未通过校验的流式模型：${requestedProvider}/${requestedModel}`);
           socket.destroy();
           return;
         }

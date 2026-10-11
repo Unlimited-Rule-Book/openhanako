@@ -38,12 +38,21 @@ export const SpeechPreviewExtension = Extension.create({
         state: {
           init: () => EMPTY,
           apply(tr, value) {
-            const meta = tr.getMeta(speechPreviewKey) as SpeechPreviewState | undefined;
-            if (meta) return meta;
-            if (value.pos === null) return value;
-            // 文档被别处改动（用户打字、插入别的内容）时，预览位置跟着平移；
-            // 否则预览会"粘"在原地、和它要插入的位置错开。
-            return { ...value, pos: tr.mapping.map(value.pos) };
+            const meta = tr.getMeta(speechPreviewKey) as Partial<SpeechPreviewState> | undefined;
+            // 先把上一轮记下的位置平移到新坐标系 —— 用户边听写边打字时，
+            // 预览位置和"最终往哪插"必须跟着一起动，两者一旦各算一套就会错位。
+            const mappedPos = value.pos === null ? null : tr.mapping.map(value.pos);
+            if (!meta) return value.pos === null ? value : { ...value, pos: mappedPos };
+            // meta 语义：
+            //   · 带 pos  —— "从这一处开始"（一轮语音的起点、或者提交后挪到新位置）
+            //   · 只带 text —— 只换预览文字，**位置沿用已平移的那个**
+            //     （以前的写法是把调用方手里那个旧数字直接写回来，等于每来一个 partial
+            //      就把平移结果覆盖掉，于是用户一边打字、预览一边错位）
+            if (meta.pos === undefined && meta.text === '') return EMPTY;
+            return {
+              pos: meta.pos !== undefined ? meta.pos : mappedPos,
+              text: meta.text !== undefined ? meta.text : value.text,
+            };
           },
         },
         props: {
@@ -74,7 +83,8 @@ export const SpeechPreviewExtension = Extension.create({
  */
 export function setSpeechPreview(
   editor: { view?: { dispatch?: (tr: any) => void }; state?: any } | null | undefined,
-  state: SpeechPreviewState,
+  // 可以只给 text（只换内容、位置沿用已平移的）或只给 pos（从这里开始）—— 见 apply 的说明
+  state: Partial<SpeechPreviewState>,
 ) {
   const view = editor?.view;
   const editorState = editor?.state;

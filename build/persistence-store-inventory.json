@@ -268,6 +268,43 @@
       "exemption": null
     },
     {
+      "id": "asr-local-models",
+      "ownerModule": "server/asr-model-downloader.ts",
+      "pathPattern": "asr-models",
+      "pathPatterns": [
+        "asr-models"
+      ],
+      "pathExclusions": [],
+      "pathKind": "tree",
+      "format": "binary-cache",
+      "schemaSource": {
+        "kind": "directory-contract",
+        "module": "core/speech-recognition/local-models.ts",
+        "contract": "model directory/file names plus per-file size and sha256, shipped as a manifest"
+      },
+      "schemaContract": {
+        "kind": "protocol",
+        "source": "core/speech-recognition/local-models.ts",
+        "compatibility": "The named runtime reader is canonical; this inventory does not imply stricter validation than runtime currently performs."
+      },
+      "openEntry": [
+        "start",
+        "importPaths"
+      ],
+      "migrationEntry": [],
+      "protocolModules": [],
+      "firstPossibleOpenPhase": "runtime_ready",
+      "firstPossibleWritePhase": "runtime_ready",
+      "epochPolicy": "regenerable",
+      "checkpointPolicy": "Excluded; model weights are re-downloadable (or re-importable) and every file is sha256-verified.",
+      "restorePolicy": "Re-download or re-import the missing files; a half-downloaded .part is never treated as a valid model.",
+      "affectedByEpochMigration": false,
+      "bootstrapSafety": null,
+      "preCoordinatorReadProjection": null,
+      "identityContract": "The manifest owns directory and file identity; size plus sha256 decide whether a cached copy is the expected model.",
+      "exemption": null
+    },
+    {
       "id": "channels",
       "ownerModule": "lib/channels/channel-store.ts",
       "pathPattern": "channels/{channelId}.yaml",
@@ -8281,6 +8318,87 @@
       "excerpt": "fsp.writeFile(jobPath, JSON.stringify(job, null, 2), \"utf-8\")",
       "reason": "Writes an office render job input, receipt, or generated output.",
       "storeId": "office-render-jobs",
+      "exemptionId": null,
+      "ordinal": 0
+    },
+    {
+      "sourceFile": "server/asr-model-downloader.ts",
+      "kind": "mkdir",
+      "excerpt": "fs.mkdirSync(path.dirname(item.targetPath), { recursive: true })",
+      "reason": "Writes, renames and removes local ASR model files under HANA_HOME/asr-models (downloaded, or imported from files the user already has).",
+      "storeId": "asr-local-models",
+      "exemptionId": null,
+      "ordinal": 0
+    },
+    {
+      "sourceFile": "server/asr-model-downloader.ts",
+      "kind": "remove-path",
+      "excerpt": "fs.rmSync(partPath, { force: true })",
+      "reason": "Writes, renames and removes local ASR model files under HANA_HOME/asr-models (downloaded, or imported from files the user already has).",
+      "storeId": "asr-local-models",
+      "exemptionId": null,
+      "ordinal": 0
+    },
+    {
+      "sourceFile": "server/asr-model-downloader.ts",
+      "kind": "remove-path",
+      "excerpt": "fs.rmSync(partPath, { force: true })",
+      "reason": "Writes, renames and removes local ASR model files under HANA_HOME/asr-models (downloaded, or imported from files the user already has).",
+      "storeId": "asr-local-models",
+      "exemptionId": null,
+      "ordinal": 1
+    },
+    {
+      "sourceFile": "server/asr-model-downloader.ts",
+      "kind": "rename",
+      "excerpt": "fs.renameSync(partPath, item.targetPath)",
+      "reason": "Writes, renames and removes local ASR model files under HANA_HOME/asr-models (downloaded, or imported from files the user already has).",
+      "storeId": "asr-local-models",
+      "exemptionId": null,
+      "ordinal": 0
+    },
+    {
+      "sourceFile": "server/asr-model-downloader.ts",
+      "kind": "write-file",
+      "excerpt": "fs.createWriteStream(partPath, { flags: resumeBytes > 0 ? 'a' : 'w' })",
+      "reason": "Writes, renames and removes local ASR model files under HANA_HOME/asr-models (downloaded, or imported from files the user already has).",
+      "storeId": "asr-local-models",
+      "exemptionId": null,
+      "ordinal": 0
+    },
+    {
+      "sourceFile": "server/asr-model-import.ts",
+      "kind": "copy-file",
+      "excerpt": "fs.copyFileSync(source, path.join(targetDir, file.name))",
+      "reason": "Writes, renames and removes local ASR model files under HANA_HOME/asr-models (downloaded, or imported from files the user already has).",
+      "storeId": "asr-local-models",
+      "exemptionId": null,
+      "ordinal": 0
+    },
+    {
+      "sourceFile": "server/asr-model-import.ts",
+      "kind": "mkdir",
+      "excerpt": "fs.mkdirSync(targetDir, { recursive: true })",
+      "reason": "Writes, renames and removes local ASR model files under HANA_HOME/asr-models (downloaded, or imported from files the user already has).",
+      "storeId": "asr-local-models",
+      "exemptionId": null,
+      "ordinal": 0
+    },
+    {
+      "sourceFile": "server/asr-model-import.ts",
+      "kind": "remove-path",
+      "excerpt": "fs.rmSync(path.join(dir, name), { force: true })",
+      "reason": "Writes, renames and removes local ASR model files under HANA_HOME/asr-models (downloaded, or imported from files the user already has).",
+      "storeId": "asr-local-models",
+      "exemptionId": null,
+      "ordinal": 0
+    },
+    {
+      "sourceFile": "server/asr-model-import.ts",
+      "kind": "remove-path",
+      "excerpt": "fs.rmSync(tempRoot, { recursive: true, force: true })",
+      "reason": "Writes, renames and removes local ASR model files under HANA_HOME/asr-models (downloaded, or imported from files the user already has).",
+      "storeId": "asr-local-models",
       "exemptionId": null,
       "ordinal": 0
     },

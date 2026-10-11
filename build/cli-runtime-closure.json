@@ -71,6 +71,12 @@
       "reason": "serverEntry is HANA_SERVER_ENTRY or a path.join() computed from HANA_ROOT; it always resolves to the compiled output of server/main-full.ts (the closed thin composition entry that statically imports the server-bootstrap root, server/index.ts, plus composition/full-root.ts), not to the server-bootstrap root's own compiled output directly. main-full.ts is deliberately not declared as a root here -- see the server-bootstrap root's reason above -- but its static import of server/index.ts means this dynamic import always terminates in code already covered by that explicit declared root."
     },
     {
+      "file": "server/asr-sidecar-manager.ts",
+      "callee": "spawn",
+      "argText": "process.execPath",
+      "reason": "The local speech-recognition sidecar (tools/asr-sidecar/server.mjs) runs in a separate Node process on purpose: a native ASR engine abort must not take the server down with it, and the model resident in memory must be decoupled from the HTTP server lifetime. process.execPath is whatever Node runtime already runs this process (the repo's Node in development, the distributed runtime in packaged mode) -- an environment-provided binary, not repo source to trace into the CLI closure; the sidecar's own source ships via the tools/ build scripts."
+    },
+    {
       "file": "core/fresh-import.ts",
       "callee": "import",
       "argText": "url.href",
@@ -1221,9 +1227,14 @@
           "root": "server-bootstrap",
           "from": "core/provider-registry.ts",
           "kind": "import-statement"
+        },
+        {
+          "root": "server-bootstrap",
+          "from": "core/speech-recognition-service.ts",
+          "kind": "import-statement"
         }
       ],
-      "reason": "Reached via esbuild source module graph, imported by core/provider-media-config.ts (import-statement); core/provider-registry.ts (import-statement)."
+      "reason": "Reached via esbuild source module graph, imported by core/provider-media-config.ts (import-statement); core/provider-registry.ts (import-statement); core/speech-recognition-service.ts (import-statement)."
     },
     {
       "path": "core/media-runtime-contract.ts",
@@ -3447,6 +3458,55 @@
         }
       ],
       "reason": "Reached via esbuild source module graph, imported by core/speech-recognition-service.ts (import-statement)."
+    },
+    {
+      "path": "core/speech-recognition/input-engines.ts",
+      "inputType": "source-graph",
+      "provenance": [
+        {
+          "root": "server-bootstrap",
+          "from": "core/preferences-manager.ts",
+          "kind": "import-statement"
+        },
+        {
+          "root": "server-bootstrap",
+          "from": "core/speech-recognition-service.ts",
+          "kind": "import-statement"
+        },
+        {
+          "root": "server-bootstrap",
+          "from": "server/index.ts",
+          "kind": "import-statement"
+        }
+      ],
+      "reason": "Reached via esbuild source module graph, imported by core/preferences-manager.ts (import-statement); core/speech-recognition-service.ts (import-statement); server/index.ts (import-statement)."
+    },
+    {
+      "path": "core/speech-recognition/local-models.ts",
+      "inputType": "source-graph",
+      "provenance": [
+        {
+          "root": "server-bootstrap",
+          "from": "core/speech-recognition/input-engines.ts",
+          "kind": "import-statement"
+        },
+        {
+          "root": "server-bootstrap",
+          "from": "server/asr-model-downloader.ts",
+          "kind": "import-statement"
+        },
+        {
+          "root": "server-bootstrap",
+          "from": "server/asr-model-import.ts",
+          "kind": "import-statement"
+        },
+        {
+          "root": "server-bootstrap",
+          "from": "server/index.ts",
+          "kind": "import-statement"
+        }
+      ],
+      "reason": "Reached via esbuild source module graph, imported by core/speech-recognition/input-engines.ts (import-statement); server/asr-model-downloader.ts (import-statement); server/asr-model-import.ts (import-statement); +1 more importer(s)."
     },
     {
       "path": "core/studio-cron-service.ts",
@@ -5707,11 +5767,16 @@
         },
         {
           "root": "server-bootstrap",
+          "from": "server/asr-model-import.ts",
+          "kind": "import-statement"
+        },
+        {
+          "root": "server-bootstrap",
           "from": "server/routes/plugins.ts",
           "kind": "import-statement"
         }
       ],
-      "reason": "Reached via esbuild source module graph, imported by lib/pi-sdk/search-tools.ts (import-statement); lib/skills/skill-package-installer.ts (import-statement); server/routes/plugins.ts (import-statement)."
+      "reason": "Reached via esbuild source module graph, imported by lib/pi-sdk/search-tools.ts (import-statement); lib/skills/skill-package-installer.ts (import-statement); server/asr-model-import.ts (import-statement); +1 more importer(s)."
     },
     {
       "path": "lib/file-history/file-history-service.ts",
@@ -109491,6 +109556,54 @@
       "reason": "Reached via esbuild source module graph, imported by lib/tools/update-settings-tool.ts (import-statement); server/routes/chat.ts (import-statement); server/routes/config.ts (import-statement); +4 more importer(s)."
     },
     {
+      "path": "server/asr-cloud-forwarder.ts",
+      "inputType": "source-graph",
+      "provenance": [
+        {
+          "root": "server-bootstrap",
+          "from": "server/index.ts",
+          "kind": "import-statement"
+        }
+      ],
+      "reason": "Reached via esbuild source module graph, imported by server/index.ts (import-statement)."
+    },
+    {
+      "path": "server/asr-model-downloader.ts",
+      "inputType": "source-graph",
+      "provenance": [
+        {
+          "root": "server-bootstrap",
+          "from": "server/index.ts",
+          "kind": "import-statement"
+        }
+      ],
+      "reason": "Reached via esbuild source module graph, imported by server/index.ts (import-statement)."
+    },
+    {
+      "path": "server/asr-model-import.ts",
+      "inputType": "source-graph",
+      "provenance": [
+        {
+          "root": "server-bootstrap",
+          "from": "server/index.ts",
+          "kind": "import-statement"
+        }
+      ],
+      "reason": "Reached via esbuild source module graph, imported by server/index.ts (import-statement)."
+    },
+    {
+      "path": "server/asr-sidecar-manager.ts",
+      "inputType": "source-graph",
+      "provenance": [
+        {
+          "root": "server-bootstrap",
+          "from": "server/index.ts",
+          "kind": "import-statement"
+        }
+      ],
+      "reason": "Reached via esbuild source module graph, imported by server/index.ts (import-statement)."
+    },
+    {
       "path": "server/block-extractors.ts",
       "inputType": "source-graph",
       "provenance": [
@@ -112755,6 +112868,23 @@
       "reason": "Reached via esbuild source module graph, imported by core/preferences-manager.ts (import-statement); server/routes/preferences.ts (import-statement)."
     },
     {
+      "path": "shared/speech-input.ts",
+      "inputType": "source-graph",
+      "provenance": [
+        {
+          "root": "server-bootstrap",
+          "from": "server/asr-cloud-forwarder.ts",
+          "kind": "import-statement"
+        },
+        {
+          "root": "server-bootstrap",
+          "from": "server/index.ts",
+          "kind": "import-statement"
+        }
+      ],
+      "reason": "Reached via esbuild source module graph, imported by server/asr-cloud-forwarder.ts (import-statement); server/index.ts (import-statement)."
+    },
+    {
       "path": "shared/text-signature.ts",
       "inputType": "source-graph",
       "provenance": [
@@ -113067,9 +113197,9 @@
     }
   ],
   "stats": {
-    "totalFiles": 9652,
+    "totalFiles": 9659,
     "byInputType": {
-      "source-graph": 671,
+      "source-graph": 678,
       "runtime-asset": 11,
       "nft-runtime-trace": 8970
     }

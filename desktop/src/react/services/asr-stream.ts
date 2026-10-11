@@ -26,7 +26,11 @@ export interface AsrStreamHandlers {
   onEndpoint?: (text: string, segmentId: number) => void;
   /**
    * 整轮结束。`pending` 是还没作为 endpoint 发出去的最后一段（已是处理后的文本），
-   * 提交它即可；`text`/`segments` 是全部内容，只用来做日志或校验。
+   * 提交它即可。
+   *
+   * `text`/`segments` 只有**批式**会填（它本就不分句，一次性给出全文）；流式路径
+   * 不透传这两个字段 —— 服务端不再发送它们（拼接完整文本没有消费者，而且按空串拼
+   * 会把英文单词粘在一起），所以流式下它们恒为空，调用方不要依赖。
    */
   onFinal?: (payload: { text: string; segments: string[]; pending: string }) => void;
   onError?: (message: string) => void;
@@ -54,7 +58,10 @@ export interface AsrStreamOptions {
   cloudModel?: { provider: string; id: string } | null;
 }
 
-const CONNECT_TIMEOUT_MS = 15_000;
+// 必须**不早于** sidecar 的启动超时（server/asr-sidecar-manager.ts 里是 30s）：
+// 首次使用要拉起进程 + 加载模型，前端若先放弃，用户看到的是「连接失败」而引擎其实马上就绪了。
+// 这里留一点余量，让服务端有机会把它自己的错误（比如模型没下载）说清楚。
+const CONNECT_TIMEOUT_MS = 35_000;
 
 /** 引擎只吃 16kHz 单声道 PCM */
 export const SPEECH_SAMPLE_RATE = 16000;
@@ -99,7 +106,13 @@ function buildServerWsUrl(path: string): string {
   return `${url}${sep}token=${encodeURIComponent(connection.token)}`;
 }
 
-/** 连上一条识别流并返回会话。本地 sidecar 与云端转发共用同一套消息协议。 */
+/**
+ * 连上一条识别流并返回会话。本地 sidecar 与云端转发共用同一套消息协议。
+ *
+ * ⚠️ 它**同步返回**：WebSocket 的握手与失败都在之后异步发生（onerror/onclose），
+ * 所以"连不上"不会在这里 throw —— 只会经 handlers.onError 回调出去。调用方若想
+ * 在连不上时做别的处理（比如回退本地），不能靠 try/catch 包住本函数，必须处理 onError。
+ */
 function connectAsrWs(wsUrl: string, handlers: AsrStreamHandlers): AsrStreamSession {
   const ws = new WebSocket(wsUrl);
   let closedByUs = false;

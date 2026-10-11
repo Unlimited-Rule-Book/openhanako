@@ -39,7 +39,7 @@ import { SessionConfirmationPrompt } from './input/SessionConfirmationPrompt';
 import { serializeEditor } from '../utils/editor-serializer';
 import { createPcm16Converter } from '../utils/pcm16';
 import { startAsrStream, SPEECH_SAMPLE_RATE, type AsrStreamHandlers, type AsrStreamSession } from '../services/asr-stream';
-import { createBatchAsrSession } from '../services/asr-batch';
+import { createBatchAsrSession, MAX_BATCH_RECORDING_MS } from '../services/asr-batch';
 import {
   clearSpeechPreview,
   setSpeechPreview,
@@ -566,9 +566,22 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
   const [speechInputBatchModel, setSpeechInputBatchModel] = useState<{ provider: string; id: string } | null>(null);
   /** 云端流式选中的实时模型（候选来自供应商配置，同样与另外两种方式分开存） */
   const [speechInputCloudModel, setSpeechInputCloudModel] = useState<{ provider: string; id: string } | null>(null);
-  const [speechInputState, setSpeechInputState] = useState<'idle' | 'listening'>('idle');
+  // connecting：引擎还在起（首次要拉起 sidecar、加载模型，可能几秒）——这期间**没有在录音**，
+  // 界面不能说「聆听中」，否则用户开头说的那句会以为被记下了。
+  // transcribing：用户已按停止、采集也停了，但引擎还在把剩余音频解完（批式还要上传 + 转写，
+  // 可能十几秒）——这时界面应显示「正在转写…」而不是继续「聆听中」。final/超时/出错后回 idle。
+  const [speechInputState, setSpeechInputState] = useState<'idle' | 'connecting' | 'listening' | 'transcribing'>('idle');
   /** 同步门闩：state 更新是异步的，靠它挡住连点导致的重复启动 */
   const speechActiveRef = useRef(false);
+  /**
+   * 递增的「任务编号」。startSpeechInput 里每一步 await 之后都要核对它。
+   *
+   * 为什么不能只用 speechActiveRef 这个布尔值：它会**被新一轮启动重新置真** ——
+   * 用户在启动过程中点了停止、又马上重新开始，上一轮那个还卡在 await 里的调用醒来时
+   * 会看到「仍然是 active」，于是继续开麦克风、覆盖新会话的引用，把连接和麦克风都泄漏掉。
+   * 编号是单调的，所以「我这一轮还作不作数」能被准确判断。
+   */
+  const speechTaskIdRef = useRef(0);
   /** 预览与最终插入的锚点（开始说话时的光标位置）；null 表示没有进行中的语音输入 */
   const speechAnchorRef = useRef<number | null>(null);
   /** 识别流会话（到本机 sidecar 的 WebSocket） */
@@ -590,6 +603,21 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
   const speechSuppressDraftSyncRef = useRef(false);
   /** 用户按停止后等 final 的兜底计时器，防止引擎不回声时界面卡在"聆听中" */
   const speechFinalTimerRef = useRef<number | null>(null);
+  /**
+   * 批式录音的自动停止计时器（到 MAX_BATCH_RECORDING_MS 触发一次，见下）。
+   * 只有云端批式才需要 —— 它把整段 PCM 攒着一次性上传，必须有真实的上限。
+   */
+  const speechMaxDurationTimerRef = useRef<number | null>(null);
+  /**
+   * 收尾是否已经发起过。用户连点"停止"时，第一次发起 finish（进入转写），
+   * 之后再点就变成"立刻取消/收尾"——不能重复调 session.finish()（批式会重复上传转写）。
+   */
+  const speechFinishRequestedRef = useRef(false);
+  /**
+   * 指向 handleSpeechInputToggle 的 ref。批式自动停止计时器在 startSpeechInput 里设置，
+   * 而那个函数定义在 toggle 之前，直接引用会造成 useCallback 循环依赖，所以走 ref。
+   */
+  const speechStopRef = useRef<() => void>(() => {});
   const inputLocked = deletedAgentReadOnly || continuingDeletedAgentSession;
 
   useEffect(() => {
@@ -1473,6 +1501,11 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
       window.clearTimeout(speechFinalTimerRef.current);
       speechFinalTimerRef.current = null;
     }
+    // 会话没了，自动停止计时器也必须撤掉，否则它稍后触发会去动一个已收尾的会话。
+    if (speechMaxDurationTimerRef.current !== null) {
+      window.clearTimeout(speechMaxDurationTimerRef.current);
+      speechMaxDurationTimerRef.current = null;
+    }
     const session = speechSessionRef.current;
     speechSessionRef.current = null;
     try { session?.abort(); } catch { /* 已断开 */ }
@@ -1489,8 +1522,11 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
    */
   const commitSpeechSegment = useCallback((overrideText?: string, targetDraftKey?: string) => {
     const ed = editor;
-    const anchor = speechAnchorRef.current;
-    if (!ed || ed.isDestroyed || anchor === null) return;
+    if (!ed || ed.isDestroyed) return;
+    // 位置以**插件里那个（随编辑平移过的）锚点**为准 —— 不能用手里的旧数字：
+    // 用户听写时可能自己打了字，文档坐标早就变了。
+    const anchor = speechPreviewKey.getState(ed.state)?.pos ?? speechAnchorRef.current;
+    if (anchor === null) return;
     const preview = speechPreviewKey.getState(ed.state)?.text ?? '';
     const text = (typeof overrideText === 'string' && overrideText) ? overrideText : preview;
     clearSpeechPreview(ed);
@@ -1507,7 +1543,9 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
     try {
       // 用 JSON text 节点插入，绕开 TiPTap 对字符串的 HTML 解析
       ed.chain().insertContentAt(anchor, { type: 'text', text }).run();
+      // 下一句从插入末尾续写：把插件里的位置也挪过去，这样它会继续跟着后续编辑平移
       speechAnchorRef.current = anchor + text.length;
+      setSpeechPreview(ed, { pos: anchor + text.length, text: '' });
       if (crossSession) {
         const json = ed.getJSON();
         setDraft(targetDraftKey!, serializeEditor(json).text, json);
@@ -1521,12 +1559,15 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
 
   /** 收尾并复位（不提交） */
   const resetSpeechInput = useCallback(() => {
+    // 作废「正在启动中」的那一轮：它醒来后会发现编号变了，于是自己收尾
+    speechTaskIdRef.current += 1;
     stopSpeechAudio();
     closeSpeechSession();
     if (editor && !editor.isDestroyed) clearSpeechPreview(editor);
     speechAnchorRef.current = null;
     speechDraftKeyRef.current = null;
     speechActiveRef.current = false;
+    speechFinishRequestedRef.current = false;
     setSpeechInputState('idle');
   }, [closeSpeechSession, editor, stopSpeechAudio]);
 
@@ -1540,10 +1581,12 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
   /** partial → 只更新预览层，完全不碰文档 */
   const applySpeechPartial = useCallback((partial: string) => {
     const ed = editor;
-    const anchor = speechAnchorRef.current;
-    if (!ed || ed.isDestroyed || anchor === null || !partial) return;
+    if (!ed || ed.isDestroyed || !partial) return;
+    // 只更新文字：位置由插件按 transaction 平移，**不要**拿旧锚点覆盖它
+    const anchor = speechPreviewKey.getState(ed.state)?.pos ?? speechAnchorRef.current;
+    if (anchor === null) return;
     if (anchor > ed.state.doc.content.size) { resetSpeechInput(); return; }
-    setSpeechPreview(ed, { pos: anchor, text: partial });
+    setSpeechPreview(ed, { text: partial });
   }, [editor, resetSpeechInput]);
 
   const startSpeechInput = useCallback(async () => {
@@ -1552,10 +1595,19 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
     // 同步门闩：speechInputState 的更新是异步的，只靠它挡不住连点
     if (speechActiveRef.current) return;
     speechActiveRef.current = true;
-    // 关键：记下当前光标位置，预览与最终插入都锚在这里
+    // 新一轮开始，收尾标记复位（上一轮的收尾不能被当成这一轮的）
+    speechFinishRequestedRef.current = false;
+    // 本轮启动的编号；下面每个 await 之后都用它判断「我还算不算数」
+    const taskId = speechTaskIdRef.current + 1;
+    speechTaskIdRef.current = taskId;
+    const isStale = () => speechTaskIdRef.current !== taskId;
+    // 关键：记下当前光标位置，预览与最终插入都锚在这里。
+    // 同时写进插件状态 —— 之后它会随每一次编辑一起平移，成为那个"唯一的锚点来源"。
     speechAnchorRef.current = ed.state.selection.from;
+    setSpeechPreview(ed, { pos: speechAnchorRef.current, text: '' });
     speechDraftKeyRef.current = draftKey ?? null;
-    setSpeechInputState('listening');
+    // 这一步只是「正在准备」，还没开始录音 —— 状态如实反映
+    setSpeechInputState('connecting');
 
     const AudioContextCtor = window.AudioContext
       || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
@@ -1602,7 +1654,13 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
           try {
             session = await startAsrStream(asrHandlers, { engine: 'cloud', cloudModel: speechInputCloudModel });
           } catch {
-            // 云端不可用（最常见是没配 API Key）→ 回退本地，不打断用户
+            // 这里的回退**只覆盖 HTTP 预检失败**：startAsrStream 里那个 POST /api/asr/stream
+            // 抛错（服务端不可用等）才会走到这。它连上之后是同步返回的，真正的 WS 握手失败
+            // （比如没配 API Key：服务端会先回一条 error 再断开）在之后异步经 onError 回调，
+            // try/catch 根本包不住 —— 那种情况只会弹提示，**不会**自动回退本地。
+            //
+            // 没做"WS 失败自动切本地"是有意的：那时麦克风已经在采、用户可能已经在说，
+            // 中途重连会丢掉开头、还要处理旧会话残留与重连风暴，风险大于收益。保持注释如实。
             addToast(t('input.speechCloudFallback'), 'info', 4000);
             session = await startAsrStream(asrHandlers, { engine: 'local', model: speechInputLocalModel });
           }
@@ -1610,8 +1668,20 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
           session = await startAsrStream(asrHandlers, { engine: 'local', model: speechInputLocalModel });
         }
       } catch (err: any) {
+        // 先看这一轮还算不算数：如果用户已经点了停止、甚至又重新开始了一轮，
+        // 这个错误属于"上一次启动"，此时
+        //   · 不该弹提示 —— 会把用户看懵（他眼前是新一轮在跑）；
+        //   · 更不能 resetSpeechInput() —— 那会把**刚起来的新一轮**一起复位掉
+        //     （active / anchor / 预览全被清），等于用户刚开口就被我们掐了。
+        if (isStale()) return;
         addToast(err?.message || t('input.audioRecordingFailed'), 'error', 6000);
         resetSpeechInput();
+        return;
+      }
+      if (isStale()) {
+        // 接引擎这段时间里用户已经取消了（或又点了开始）：这一轮的连接不能再留着，
+        // 否则它会变成一个没人收的孤儿连接。
+        try { session.abort(); } catch { /* 已断开 */ }
         return;
       }
       speechSessionRef.current = session;
@@ -1620,9 +1690,11 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true },
       });
-      if (!speechActiveRef.current) {
+      if (isStale()) {
         // 等麦克风授权期间用户已经取消了 —— 别把已经开的流晾着
+        // （授权弹窗可能停留很久，这期间用户完全可能点停止）
         stream.getTracks().forEach(track => track.stop());
+        try { session.abort(); } catch { /* 已断开 */ }
         return;
       }
       // 让浏览器直接按 16kHz 采样；平台不认这个参数时给原生采样率，
@@ -1642,6 +1714,19 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
       processor.connect(silentGain);
       silentGain.connect(audioContext.destination);
       speechAudioRef.current = { stream, audioContext, source, processor, silentGain };
+      // 到这里才是真的在采集了（麦克风已开、处理器已接上）
+      setSpeechInputState('listening');
+      // 云端批式：录音要一直攒 PCM 到松手，必须有真实时长上限（见 MAX_BATCH_RECORDING_MS）。
+      // 到点自动走"用户按停止"那条路（提示 + finish → 上传转写），不让用户一直录下去。
+      // 用 ref 调 toggle：这一轮此刻必然 active，toggle 会走停止分支。
+      if (speechInputEngine === 'cloud-batch') {
+        speechMaxDurationTimerRef.current = window.setTimeout(() => {
+          speechMaxDurationTimerRef.current = null;
+          if (!speechActiveRef.current) return;   // 已经停了/取消了，别再动
+          addToast(t('input.speechMaxDurationReached'), 'info', 6000);
+          speechStopRef.current();
+        }, MAX_BATCH_RECORDING_MS);
+      }
     } catch (err) {
       console.warn('[input] failed to start speech input', err);
       addToast(t('input.audioRecordingFailed'), 'error', 6000);
@@ -1652,14 +1737,35 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
   const handleSpeechInputToggle = useCallback(() => {
     // 用同步 ref 判断，避免连点穿透到 startSpeechInput
     if (speechActiveRef.current) {
+      // 用户已经按过一次停止、正在收尾（转写中）——再点一次就是"立刻取消/收尾"：
+      // 直接 endSpeechInput（会 abort 会话），不要让用户卡在"正在转写…"上。
+      if (speechFinishRequestedRef.current) {
+        endSpeechInput();
+        return;
+      }
+      speechFinishRequestedRef.current = true;
       // 用户按停止 = 立即提交剩余预览（对应 final）：先停采集，再让引擎把剩余
-      // 音频解完，final 回来时提交。兜底计时器防止引擎不回声时卡在"聆听中"。
+      // 音频解完，final 回来时提交。兜底计时器防止引擎不回声时界面卡在"正在转写…"。
       const session = speechSessionRef.current;
       stopSpeechAudio();
+      // 采集停了，自动停止计时器也就没意义了；撤掉，免得它稍后误触发"再停止一次"。
+      if (speechMaxDurationTimerRef.current !== null) {
+        window.clearTimeout(speechMaxDurationTimerRef.current);
+        speechMaxDurationTimerRef.current = null;
+      }
       if (session) {
+        // 补一小段静音再收尾：ScriptProcessor 的缓冲区里还有最多约 0.25 秒音频没送出去，
+        // 直接 finish 会让最后一个字被截断。静音既把管道顶一遍，也给引擎的端点检测
+        // 一个「句子结束了」的信号（多数流式引擎靠静音判定句尾）。
+        try {
+          session.sendPcm(new ArrayBuffer(Math.round(SPEECH_SAMPLE_RATE * 0.3) * 2));
+        } catch { /* 已断开 */ }
         session.finish();
+        // 采集已停、等引擎出结果 —— 界面从"聆听中"切到"正在转写…"。
+        // final / 超时兜底 / 出错都会走 endSpeechInput → resetSpeechInput 把它收回 idle。
+        setSpeechInputState('transcribing');
         if (speechFinalTimerRef.current !== null) window.clearTimeout(speechFinalTimerRef.current);
-        // 兜底计时器：防止引擎不回声时界面卡在"聆听中"。
+        // 兜底计时器：防止引擎不回声时界面卡在"正在转写…"。
         // 云端批式要上传 + 转写，比流式慢得多（几秒到十几秒），给足时间；
         // 流式引擎正常几百毫秒就回 final，5 秒足够。
         speechFinalTimerRef.current = window.setTimeout(() => {
@@ -1673,6 +1779,9 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
     }
     void startSpeechInput();
   }, [endSpeechInput, speechInputEngine, startSpeechInput, stopSpeechAudio]);
+
+  // 把 toggle 挂到 ref 上，供批式自动停止计时器（定义在 startSpeechInput 里）回调。
+  useEffect(() => { speechStopRef.current = handleSpeechInputToggle; }, [handleSpeechInputToggle]);
 
   // 切会话、输入被锁定（只读会话）时强制收尾 —— 这两种都算"用户终止了语音输入"，
   // 把待定内容提交进文档（提交 ≠ 发送，落到输入框后用户还能自己改）。
@@ -2037,6 +2146,19 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
   const submitEditorMessage = useCallback(async (type: 'prompt' | 'interject') => {
     if (inputLocked) return;
     if (!editor) return;
+    // 语音输入还在进行时按发送：**未落定的那句只存在于预览层**（预览故意不写进文档，
+    // 免得高频 partial 搅乱撤销历史），而下面的 text 只从文档取 —— 不先提交就等于把
+    // 用户刚说出口的那句丢掉。所以这里先把预览落进文档，再走原来的发送流程。
+    // 代价：这一小段的标点/数字规整用的是引擎已给的原始预览（来不及等 final 回来）。
+    if (speechActiveRef.current) {
+      stopSpeechAudio();
+      closeSpeechSession();
+      commitSpeechSegment();
+      speechAnchorRef.current = null;
+      speechDraftKeyRef.current = null;
+      speechActiveRef.current = false;
+      setSpeechInputState('idle');
+    }
     const editorJson = editor.getJSON();
     const { text: rawText, skills, fileRefs, sessionRefs, agentMentions } = serializeEditor(editorJson);
     const text = rawText.trim();
@@ -2408,7 +2530,7 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
     } finally {
       setSending(false);
     }
-  }, [addToast, editor, inputLocked, attachedFiles, docContextAttached, connected, isStreaming, sending, currentDoc, clearAttachedFiles, clearAttachedFilesForSession, clearDraft, setDocContextAttached, slashCommands, slashSelected, handleSlashSelect, supportsVision, currentModelInfo, loadVisionAuxiliaryConfig, modelSwitching, t]);
+  }, [addToast, editor, inputLocked, attachedFiles, docContextAttached, connected, isStreaming, sending, currentDoc, clearAttachedFiles, clearAttachedFilesForSession, clearDraft, closeSpeechSession, commitSpeechSegment, stopSpeechAudio, setDocContextAttached, slashCommands, slashSelected, handleSlashSelect, supportsVision, currentModelInfo, loadVisionAuxiliaryConfig, modelSwitching, t]);
 
   const handleSend = useCallback(async () => {
     await submitEditorMessage('prompt');
@@ -2648,7 +2770,8 @@ function InputAreaInner({ surface }: Required<InputAreaProps>) {
             audioRecordingBusy={audioRecordingState === 'starting' || audioRecordingState === 'stopping'}
             onAudioToggle={handleAudioRecordToggle}
             speechInputEnabled={speechInputEnabled && !inputLocked}
-            speechInputActive={speechInputState === 'listening'}
+            speechInputActive={speechInputState !== 'idle'}
+            speechInputPhase={speechInputState}
             onSpeechInputToggle={handleSpeechInputToggle}
             onSend={handleSend}
             onSteer={handleSteer}

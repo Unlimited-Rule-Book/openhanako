@@ -56,6 +56,73 @@ function writeSourceFile(relativePath: string, content: Buffer) {
   return full;
 }
 
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(buf: Buffer): number {
+  let c = 0xffffffff;
+  for (const byte of buf) c = CRC_TABLE[(c ^ byte) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+/**
+ * 手写一个最小 ZIP（STORE，不压缩）。
+ *
+ * 为什么不用 archiver：越界用例必须能塞进 `../` 这样的条目名，
+ * 而 archiver 会把 `../` 规范化掉（实测 `../escape.txt` 被改写成 `escape.txt`），
+ * 根本造不出这种条目。ZIP 结构很简单，按规范手写即可，也让用例不依赖压缩库行为。
+ */
+function buildMinimalZip(entries: Array<{ name: string; content: Buffer }>): Buffer {
+  const localParts: Buffer[] = [];
+  const centralParts: Buffer[] = [];
+  let offset = 0;
+  for (const { name, content } of entries) {
+    const nameBuf = Buffer.from(name, 'utf8');
+    const crc = crc32(content);
+    const size = content.length;
+
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0); // 本地文件头签名
+    local.writeUInt16LE(20, 4); // 需要的解压版本
+    local.writeUInt16LE(0, 6); // 通用标志位
+    local.writeUInt16LE(0, 8); // 压缩方法 0 = STORE
+    local.writeUInt32LE(crc, 14);
+    local.writeUInt32LE(size, 18); // 压缩后大小
+    local.writeUInt32LE(size, 22); // 原始大小
+    local.writeUInt16LE(nameBuf.length, 26);
+    local.writeUInt16LE(0, 28); // 额外字段长度
+    localParts.push(local, nameBuf, content);
+
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0); // 中央目录文件头签名
+    central.writeUInt16LE(20, 4); // 制作版本
+    central.writeUInt16LE(20, 6); // 需要的解压版本
+    central.writeUInt32LE(crc, 16);
+    central.writeUInt32LE(size, 20);
+    central.writeUInt32LE(size, 24);
+    central.writeUInt16LE(nameBuf.length, 28);
+    central.writeUInt32LE(offset, 42); // 该条目本地文件头的偏移
+    centralParts.push(central, nameBuf);
+
+    offset += 30 + nameBuf.length + size;
+  }
+  const centralDir = Buffer.concat(centralParts);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0); // 中央目录结束记录签名
+  eocd.writeUInt16LE(entries.length, 8);
+  eocd.writeUInt16LE(entries.length, 10);
+  eocd.writeUInt32LE(centralDir.length, 12);
+  eocd.writeUInt32LE(offset, 16);
+  return Buffer.concat([...localParts, centralDir, eocd]);
+}
+
 describe('模型导入', () => {
   it('目录名与文件名都乱来，只要内容对就能认出来并归位到清单里的目录名', async () => {
     // 用户手上的样子：目录叫「新建文件夹 (3)」，文件被重命名过
@@ -180,5 +247,45 @@ describe('模型导入', () => {
     await importer.importPaths([sourceDir]);
 
     expect(onFilesChanged).not.toHaveBeenCalled();
+  });
+
+  it('zip 走内置 JS 解压：用 zip 拖进模型文件能正常导入成功', async () => {
+    // 文件名随便取（识别靠内容指纹）；这里只验证 zip 这条解压通路可用。
+    const zipPath = writeSourceFile('model.zip', buildMinimalZip([
+      { name: 'some/random-name.bin', content: A },
+      { name: 'some/another-name.bin', content: B },
+    ]));
+
+    const importer = createAsrModelImporter({ modelsRoot, specs });
+    const outcome = await importer.importPaths([zipPath]);
+
+    expect(outcome.placed).toEqual(['asr-model']);
+    expect(outcome.errors).toEqual([]);
+    expect(fs.readFileSync(path.join(modelsRoot, 'official-dir-name', 'encoder.onnx')).equals(A)).toBe(true);
+    expect(fs.readFileSync(path.join(modelsRoot, 'official-dir-name', 'tokens.txt')).equals(B)).toBe(true);
+  });
+
+  it('zip 含越界路径条目（../）→ 必须被拒绝，且目标目录之外不产生文件', async () => {
+    // 解压临时目录在 os.tmpdir() 下再 mkdtemp 一层，所以 `../../<唯一名>` 正好落到 os.tmpdir()；
+    // 用唯一名是为了让"外部是否被写入"这个断言可核查又不误伤别的进程。
+    const escapeName = `asr-import-escape-${process.pid}-${Date.now()}`;
+    const escapePath = path.join(os.tmpdir(), escapeName);
+    fs.rmSync(escapePath, { force: true }); // 清掉历史残留，保证断言可信
+
+    const zipPath = writeSourceFile('evil.zip', buildMinimalZip([
+      { name: `../../${escapeName}`, content: Buffer.from('path traversal payload') },
+    ]));
+
+    const importer = createAsrModelImporter({ modelsRoot, specs });
+    const outcome = await importer.importPaths([zipPath]);
+
+    expect(outcome.placed).toEqual([]);
+    expect(outcome.errors.length).toBeGreaterThan(0);
+    // 错误里带出那条越界条目，说明是被**路径校验**挡下的（而不是别的原因）
+    expect(outcome.errors.join(' ')).toContain(escapeName);
+    // 关键：越界条目没有被写到目标目录之外（旧实现是解压后才扫，拦不住）
+    expect(fs.existsSync(escapePath)).toBe(false);
+
+    fs.rmSync(escapePath, { force: true });
   });
 });

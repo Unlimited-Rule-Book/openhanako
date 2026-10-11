@@ -425,6 +425,11 @@ export function MediaTab() {
   ];
   const inputEngineValue = speechConfig?.inputEngine || 'local';
   const inputLocalModelValue = speechConfig?.inputLocalModel || 'zh-14M';
+
+  // 换了识别引擎或本地模型就把导入面板收起来。
+  // 否则：在 A 模型缺文件时打开过面板，之后切到同样缺文件的 B，面板会「自己弹出来」——
+  // 用户没有再做任何操作，这个面板出现在眼前只因为一个残留的开关。
+  useEffect(() => { setAsrImportOpen(false); }, [inputEngineValue, inputLocalModelValue]);
   const inputBatchModelValue = speechConfig?.inputBatchModel
     ? `${speechConfig.inputBatchModel.provider}/${speechConfig.inputBatchModel.id}`
     : '';

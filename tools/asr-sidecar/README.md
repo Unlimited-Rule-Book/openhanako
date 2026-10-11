@@ -43,6 +43,15 @@ node server.mjs --silence 1.2                # 停顿多久算说完（秒，默
 
 只绑 `127.0.0.1` —— 这是本机能力，不对外暴露。
 
+> **注意 stdin（生命线）**：sidecar 把 stdin 当作父进程的生命线 —— 一旦 stdin 关闭
+> （读到 EOF），它会主动退出，免得应用被强杀后残留一个抱着几百 MB 模型的孤儿进程
+> （实现见 `server.mjs` 里 `process.stdin.on('end'/'close')` 那段）。
+> - 在终端里手敲上面几条命令时 stdin 是 TTY，不会有 EOF，**用法不变**，照常常驻。
+> - 但如果把 stdin 接到空/已关闭的输入上（例如 `node server.mjs < /dev/null`、
+>   `cat /dev/null | node server.mjs`），或在没有终端的 CI / `nohup` 环境里直接跑，
+>   它会在启动后**立刻退出**。这是预期行为、不是崩溃；需要常驻时保留一个打开的
+>   stdin 即可（直接在终端里跑就行）。
+
 ### 句末后处理
 
 本地识别模型有两处先天不足，都在**句末**补上（partial 保持原始输出，句内不做）：

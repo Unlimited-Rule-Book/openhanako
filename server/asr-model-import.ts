@@ -13,7 +13,9 @@
  *    GB 级的权重文件既不进内存、也不过 HTTP —— 所以没有超时、没有内存峰值、
  *    也不需要在 HTTP 层做流式上传。
  *
- * 支持的输入：普通文件、目录（递归）、`.zip`（用系统自带 `tar` 解，零依赖）。
+ * 支持的输入：普通文件、目录（递归）、`.zip`。
+ * `.zip` 用应用自带的 JS 解压（`lib/extract-zip`），**不借系统 `tar`**：
+ * Linux 上的 GNU tar 解不了 zip（只有 Windows/macOS 的 bsdtar 才行）。
  * 不支持 `.rar` / `.7z`（需要外部二进制），调用方会得到明确的提示文案。
  */
 
@@ -22,6 +24,7 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
+import { extractZip } from '../lib/extract-zip.ts';
 import {
   LOCAL_MODEL_SPECS,
   inspectLocalModel,
@@ -74,21 +77,67 @@ function walk(dirPath: string, out: string[] = []): string[] {
   return out;
 }
 
-/** 解压到临时目录。用系统自带 `tar`（Win10+/macOS/Linux 都有 bsdtar，能解 zip），不引新依赖。 */
+/** `tar -tf` 只列条目、不落盘 —— 用作**解压前**的逐条路径校验。 */
+function listTarEntries(archivePath: string): Promise<string[]> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      'tar',
+      ['-tf', archivePath],
+      { timeout: EXTRACT_TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err) reject(new Error(`读取压缩包条目失败（${path.basename(archivePath)}）：${err.message}`));
+        else resolve(stdout.split('\n').map((line) => line.trim()).filter((line) => line.length > 0));
+      },
+    );
+  });
+}
+
+/** 条目名归一化后是否仍落在 target 目录内（挡 `../` 与绝对路径这两种越界写法）。 */
+function isInsideTarget(target: string, entryName: string): boolean {
+  const base = path.resolve(target);
+  const resolved = path.resolve(base, entryName);
+  return resolved === base || resolved.startsWith(base + path.sep);
+}
+
+/**
+ * 解压到临时目录。
+ *
+ * **zip 用应用自带的 JS 解压（`lib/extract-zip`），不走系统 `tar`。**
+ * 平台差异是硬事实：Windows/macOS 自带 bsdtar（能解 zip），
+ * 但 Linux 上的 GNU tar **不支持**解 zip —— 借系统 tar 会让 Linux 用户的导入直接失败。
+ * extract-zip 在**读取每个条目时**就逐条校验：yauzl 会拒绝 `../`、绝对路径、反斜杠条目，
+ * 我们的 wrapper 再额外拒绝 symlink entry；且这些校验都发生在**写盘之前**，
+ * 所以路径穿越在解压过程中就被挡下，而不是等解压完再补救。
+ *
+ * 非 zip（例如 .tar.gz）才交给系统 `tar`：先用 `tar -tf` **只列条目**逐条校验路径，
+ * 确认全部落在临时目录内之后，才真正 `tar -xf` 落盘。
+ */
 async function extractArchive(archivePath: string, tempRoot: string): Promise<string[]> {
   const { size } = fs.statSync(archivePath);
   if (size > MAX_ARCHIVE_BYTES) {
     throw new Error(`压缩包超过 ${Math.round(MAX_ARCHIVE_BYTES / 1073741824)} GB，请先解压再拖进来`);
   }
   const target = fs.mkdtempSync(path.join(tempRoot, 'asr-import-'));
-  await new Promise<void>((resolve, reject) => {
-    execFile('tar', ['-xf', archivePath, '-C', target], { timeout: EXTRACT_TIMEOUT_MS }, (err) => {
-      if (err) reject(new Error(`解压失败（${path.basename(archivePath)}）：${err.message}`));
-      else resolve();
+
+  if (/\.zip$/i.test(archivePath)) {
+    await extractZip(archivePath, target);
+  } else {
+    // 先校验、后解压：若先解压再检查，越界条目在检查之前就已经写到了目标目录之外。
+    for (const entry of await listTarEntries(archivePath)) {
+      if (!isInsideTarget(target, entry)) {
+        throw new Error(`压缩包里有越界路径（${entry}），已拒绝解压`);
+      }
+    }
+    await new Promise<void>((resolve, reject) => {
+      execFile('tar', ['-xf', archivePath, '-C', target], { timeout: EXTRACT_TIMEOUT_MS }, (err) => {
+        if (err) reject(new Error(`解压失败（${path.basename(archivePath)}）：${err.message}`));
+        else resolve();
+      });
     });
-  });
+  }
+
   const files = walk(target);
-  // 防"压缩包炸弹式路径穿越"：解出来的文件必须都在临时目录里
+  // 第二道防线：解压完再扫一遍。主要防护已在解压时逐条完成，这里只是兜底。
   for (const file of files) {
     const resolved = path.resolve(file);
     if (!resolved.startsWith(path.resolve(target) + path.sep)) {
