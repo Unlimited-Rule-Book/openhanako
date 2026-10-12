@@ -283,12 +283,18 @@ describe('本地模型下载器', () => {
       ok: true,
       status: 200,
       body: {
-        async *[Symbol.asyncIterator]() {
-          await new Promise((_, reject) => {
-            const signal = init?.signal as AbortSignal | undefined;
-            if (signal?.aborted) return reject(new Error('aborted'));
-            signal?.addEventListener('abort', () => reject(new Error('aborted')));
-          });
+        // 不用生成器：它从头到尾不会 yield（只等 abort 然后 reject），
+        // eslint 的 require-yield 会把这种"假生成器"判成错误（CI 就是被这条拦下的）。
+        // 也不要"async 方法直接返回 Promise"那种写法 —— 那会改变 await 的时序。
+        // 这里给一个**最小迭代器**：next() 一直等到 abort 再拒绝，行为与原来的生成器一致。
+        [Symbol.asyncIterator]() {
+          return {
+            next: () => new Promise<IteratorResult<Uint8Array>>((_, reject) => {
+              const signal = init?.signal as AbortSignal | undefined;
+              if (signal?.aborted) return reject(new Error('aborted'));
+              signal?.addEventListener('abort', () => reject(new Error('aborted')));
+            }),
+          };
         },
       } as unknown as ReadableStream<Uint8Array>,
     } as unknown as Response));

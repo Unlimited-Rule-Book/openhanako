@@ -701,6 +701,13 @@
     "shared/workspace-scope.ts",
     "shared/workspace-skill-paths.ts",
     "shared/workspace-ui-state.ts",
-    "shared/yuan-visuals.ts"
+    "shared/yuan-visuals.ts",
+    "core/speech-recognition/input-engines.ts",
+    "core/speech-recognition/local-models.ts",
+    "server/asr-cloud-forwarder.ts",
+    "server/asr-model-downloader.ts",
+    "server/asr-model-import.ts",
+    "server/asr-sidecar-manager.ts",
+    "shared/speech-input.ts"
   ]
 }
