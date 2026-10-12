@@ -158,6 +158,15 @@ npm test
 npm run typecheck
 ```
 
+## 提交 Issue
+
+Issue 只描述问题或需求，不接受代码实现（修复建议、补丁、diff、实现方案或示例），不符合的会直接关闭。
+
+- **Bug**：请让你的 Agent 在你的环境里复现并排查，按 Bug Report 模板提交可验收的问题报告：列出实际出现的问题、复现步骤和验收方式，不写怎么改。
+- **Feature**：建议先和你的 Agent 聊一聊，再按 Feature Request 模板提交 Spec：想要什么、为什么需要、做到什么程度算完成，不写实现。
+
+详见[贡献指南](CONTRIBUTING.md)。
+
 ## 致谢
 
 - [tw93/kami](https://github.com/tw93/kami)：beautify 插件 HTML 美学规范的「路由器 + 平级章节按需获取」渐进披露结构受其启发。

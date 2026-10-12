@@ -152,6 +152,15 @@ npm test
 npm run typecheck
 ```
 
+## Filing Issues
+
+Issues describe problems or needs only. We do not accept code implementations (fix suggestions, patches, diffs, implementation plans or examples). Issues that break this rule are closed.
+
+- **Bug**: Have your Agent reproduce and investigate the problem in your environment, then submit a verifiable report with the Bug Report template: list the actual problems, the steps to reproduce them, and how to verify a fix. Do not describe how to change the code.
+- **Feature**: Talk the idea through with your Agent first, then submit a spec with the Feature Request template: what you want, why you need it, and what result counts as done. Do not describe an implementation.
+
+See [Contributing](CONTRIBUTING.md) for details.
+
 ## Acknowledgments
 
 - [tw93/kami](https://github.com/tw93/kami): the progressive-disclosure structure of the beautify plugin's HTML aesthetic guide (a router entry with flat on-demand sections) was inspired by this project.
